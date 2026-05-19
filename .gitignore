@@ -25,15 +25,38 @@ dist/
 logs/
 
 # Database and generated storage
-storage/
-datasets/
+/storage/
+/datasets/
 *.sqlite
 *.db
 postgres-data/
 pgdata/
 
 # Raw/private clinical data
-四诊仪数据整理/
+/四诊仪数据整理/
+
+# Data artifacts
+*.jsonl
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.wav
+*.mp3
+*.pdf
+
+# Ignore data JSON by default; allow source/config package JSON explicitly.
+*.json
+!/.env.example
+!/config/*.json
+!/frontend/package.json
+!/frontend/package-lock.json
+!/package.json
+/package-lock.json
 
 # Generated reports and office temp files
 *.tmp
