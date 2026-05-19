@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+.vite/
+
+# Environment and local runtime
+.env
+*.local
+*.log
+logs/
+
+# Database and generated storage
+storage/
+datasets/
+*.sqlite
+*.db
+postgres-data/
+pgdata/
+
+# Raw/private clinical data
+四诊仪数据整理/
+
+# Generated reports and office temp files
+*.tmp
+~$*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.gitstore/

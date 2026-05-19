@@ -1,0 +1,9 @@
+﻿SQLAlchemy>=1.4,<3.0
+psycopg2-binary>=2.9,<3.0
+pandas>=1.5
+openpyxl>=3.0
+xlrd>=2.0
+xlsxwriter>=3.0
+tqdm>=4.66
+python-dotenv>=1.0
+Flask>=3.0,<4.0

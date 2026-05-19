@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: tcm_platform_postgres
+    environment:
+      POSTGRES_DB: tcm_platform
+      POSTGRES_USER: tcm
+      POSTGRES_PASSWORD: tcm_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - tcm_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcm -d tcm_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tcm_postgres_data:
