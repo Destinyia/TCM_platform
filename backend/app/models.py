@@ -64,6 +64,22 @@ class NameAliasRule(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class Device(Base):
+    __tablename__ = "dim_device"
+    __table_args__ = (UniqueConstraint("source_vendor", "source_device_id", name="uq_device_source"),)
+
+    device_id = uuid_pk()
+    source_vendor = Column(Text, nullable=False)
+    source_device_id = Column(Text, nullable=False)
+    device_model = Column(Text)
+    sensor_type = Column(Text)
+    firmware_version = Column(Text)
+    sampling_rate = Column(Numeric(10, 2))
+    calibration_date = Column(Date)
+    device_meta_json = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class Visit(Base):
     __tablename__ = "fact_visit"
     __table_args__ = (UniqueConstraint("source_vendor", "source_visit_id", name="uq_visit_source"),)
@@ -173,6 +189,136 @@ class VisitFeatureWide(Base):
     feature_count = Column(Integer, nullable=False, default=0)
     parser_version = Column(Text, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class FeatureVariable(Base):
+    __tablename__ = "dim_feature_variable"
+
+    feature_name = Column(Text, primary_key=True)
+    display_name = Column(Text, nullable=False)
+    modality_type = Column(Text, nullable=False)
+    feature_level = Column(Text, nullable=False)
+    source_vendor = Column(Text, nullable=False, default="standard")
+    data_type = Column(Text, nullable=False)
+    unit = Column(Text)
+    category = Column(Text)
+    is_ml_feature = Column(Boolean, nullable=False, default=False)
+    is_quality_feature = Column(Boolean, nullable=False, default=False)
+    valid_range_json = Column(JSONB)
+    description = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PulseMeasurement(Base):
+    __tablename__ = "fact_pulse_measurement"
+    __table_args__ = (UniqueConstraint("modality_record_id", "source_measurement_id", name="uq_pulse_measurement_source"),)
+
+    measurement_id = uuid_pk()
+    visit_id = Column(UUID(as_uuid=True), ForeignKey("fact_visit.visit_id"), nullable=False)
+    modality_record_id = Column(UUID(as_uuid=True), ForeignKey("fact_modality_record.modality_record_id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("dim_user.user_id"), nullable=False)
+    device_id = Column(UUID(as_uuid=True), ForeignKey("dim_device.device_id"))
+    source_vendor = Column(Text, nullable=False)
+    source_measurement_id = Column(Text, nullable=False)
+    start_time = Column(DateTime(timezone=True))
+    end_time = Column(DateTime(timezone=True))
+    duration_seconds = Column(Numeric(10, 2))
+    visit_slot = Column(Text)
+    collection_hour = Column(Numeric(6, 3))
+    hand_side = Column(Text)
+    pulse_position = Column(Text)
+    sampling_rate = Column(Numeric(10, 2))
+    quality_status = Column(Text)
+    source_meta_json = Column(JSONB)
+    feature_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PulseWaveformAsset(Base):
+    __tablename__ = "fact_pulse_waveform_asset"
+
+    waveform_asset_id = uuid_pk()
+    measurement_id = Column(UUID(as_uuid=True), ForeignKey("fact_pulse_measurement.measurement_id"), nullable=False)
+    asset_id = Column(UUID(as_uuid=True), ForeignKey("fact_file_asset.asset_id"))
+    channel_name = Column(Text, nullable=False)
+    hand_side = Column(Text)
+    pulse_position = Column(Text)
+    sample_count = Column(Integer)
+    sampling_rate = Column(Numeric(10, 2))
+    storage_uri = Column(Text)
+    data_format = Column(Text)
+    file_hash = Column(Text)
+    preview_json = Column(JSONB)
+    summary_json = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PulsePositionFeature(Base):
+    __tablename__ = "fact_pulse_position_feature"
+
+    position_feature_id = uuid_pk()
+    measurement_id = Column(UUID(as_uuid=True), ForeignKey("fact_pulse_measurement.measurement_id"), nullable=False)
+    hand_side = Column(Text)
+    pulse_position = Column(Text, nullable=False)
+    feature_name = Column(Text, nullable=False)
+    feature_value = Column(Numeric(18, 6))
+    feature_text = Column(Text)
+    feature_unit = Column(Text)
+    source_field = Column(Text)
+    parser_version = Column(Text)
+    quality_weight = Column(Numeric(8, 4))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AnalysisRun(Base):
+    __tablename__ = "analysis_run"
+
+    analysis_run_id = uuid_pk()
+    analysis_type = Column(Text, nullable=False)
+    dataset_version_id = Column(UUID(as_uuid=True), ForeignKey("dataset_version.dataset_version_id"))
+    code_version = Column(Text)
+    parameter_json = Column(JSONB)
+    status = Column(Text, nullable=False, default="created")
+    result_summary_json = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PulseMeasurementQuality(Base):
+    __tablename__ = "fact_pulse_measurement_quality"
+    __table_args__ = (UniqueConstraint("analysis_run_id", "measurement_id", name="uq_pulse_measurement_quality_run"),)
+
+    measurement_quality_id = uuid_pk()
+    analysis_run_id = Column(UUID(as_uuid=True), ForeignKey("analysis_run.analysis_run_id"), nullable=False)
+    measurement_id = Column(UUID(as_uuid=True), ForeignKey("fact_pulse_measurement.measurement_id"), nullable=False)
+    drift_severity_index = Column(Numeric(8, 4))
+    stable_segment_ratio = Column(Numeric(8, 4))
+    best_segment_start_time = Column(Numeric(10, 3))
+    best_segment_end_time = Column(Numeric(10, 3))
+    best_segment_quality_score = Column(Numeric(8, 4))
+    signal_quality_score = Column(Numeric(8, 4))
+    measurement_validity_label = Column(Text)
+    result_json = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PulseFeatureReliability(Base):
+    __tablename__ = "fact_pulse_feature_reliability"
+    __table_args__ = (UniqueConstraint("analysis_run_id", "feature_name", name="uq_pulse_feature_reliability_run"),)
+
+    feature_reliability_id = uuid_pk()
+    analysis_run_id = Column(UUID(as_uuid=True), ForeignKey("analysis_run.analysis_run_id"), nullable=False)
+    feature_name = Column(Text, nullable=False)
+    drift_sensitivity = Column(Numeric(8, 4))
+    device_sensitivity = Column(Numeric(8, 4))
+    within_session_cv = Column(Numeric(8, 4))
+    within_session_icc = Column(Numeric(8, 4))
+    repeatability_icc = Column(Numeric(8, 4))
+    missing_rate = Column(Numeric(8, 4))
+    outlier_rate = Column(Numeric(8, 4))
+    quality_dependency_score = Column(Numeric(8, 4))
+    feature_reliability_grade = Column(Text)
+    result_json = Column(JSONB)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class QualityEvent(Base):

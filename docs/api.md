@@ -212,6 +212,8 @@ Query：
 
 ## 4. 脉诊分析 API
 
+当前 `/api/demo/pulse/*` 仍是展示型 demo API。脉诊分析模块作为数据平台下游任务时，需要进一步提供 analysis-ready 数据集、manifest、波形资产、设备信息和分析结果回写接口。详细接口约束见 `docs/脉诊分析下游闭环接口需求.md`。
+
 ### 4.1 `GET /api/demo/pulse/records`
 
 用途：脉诊记录明细。
@@ -256,17 +258,83 @@ Query：
 | --- | --- |
 | `user_id` | 可选 |
 
-## 5. Ingest API
+## 5. 脉诊 analysis-ready API
 
-### 5.1 `POST /api/ingest/standard-storage`
+一阶段新增独立蓝图，注册前缀 `/api/pulse`。这些接口面向下游脉诊可信度分析，不替代 `/api/demo/pulse/*` 展示接口。
+
+### 5.1 `GET /api/pulse/measurements`
+
+用途：查询脉诊 measurement 样本主表。
+
+Query：
+
+| 参数 | 说明 |
+| --- | --- |
+| `user_id` | 可选，按用户过滤 |
+| `source_vendor` | 可选，按来源过滤 |
+| `visit_slot` | 可选，`早/中/晚` |
+| `quality_status` | 可选，按 visit 质量过滤 |
+| `device_id` | 可选，按设备过滤 |
+| `has_waveform` | 可选，`true/false` |
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `measurement_id` | 脉诊测量 ID |
+| `visit_id` / `modality_record_id` | 平台追溯键 |
+| `user_id` / `user_name` | 用户信息 |
+| `source_vendor` / `source_measurement_id` | 来源信息 |
+| `start_time` / `duration_seconds` | 采集时间与时长 |
+| `visit_slot` / `collection_hour` | 离散和连续时间变量 |
+| `hand_side` / `pulse_position` | 采集侧别和部位 |
+| `device_id` / `device_model` / `source_device_id` | 设备信息 |
+| `quality_status` / `quality_flags` | 质量状态 |
+| `feature_json` | measurement 级特征摘要 |
+
+### 5.2 `GET /api/pulse/measurements/{measurement_id}`
+
+用途：查询单次脉诊 measurement 详情。
+
+### 5.3 `GET /api/pulse/measurements/{measurement_id}/waveforms`
+
+用途：查询单次测量的波形资产索引和预览点。
+
+返回字段来自 `fact_pulse_waveform_asset`，包括 `channel_name`、`sample_count`、`sampling_rate`、`storage_uri`、`data_format`、`preview_json`、`summary_json`。
+
+### 5.4 `GET /api/pulse/measurements/{measurement_id}/position-features`
+
+用途：查询单次测量的部位级特征明细。
+
+返回字段来自 `fact_pulse_position_feature`，包括 `hand_side`、`pulse_position`、`feature_name`、`feature_value`、`source_field`、`parser_version`、`quality_weight`。
+
+### 5.5 `GET /api/pulse/features`
+
+用途：查询 measurement 级扁平特征行。
+
+Query：
+
+| 参数 | 说明 |
+| --- | --- |
+| `feature_name` | 可选，按变量名过滤 |
+
+### 5.6 `GET /api/pulse/feature-variables`
+
+用途：查询脉诊变量字典。
+
+返回字段来自 `dim_feature_variable`，包括变量名、中文名、模态、粒度、数据类型、单位、类别、是否可进入机器学习、是否质量字段和合理范围。
+
+## 6. Ingest API
+
+### 6.1 `POST /api/ingest/standard-storage`
 
 用途：标准化本地存储相关入口。
 
-### 5.2 `POST /api/ingest/parse-structured-data`
+### 6.2 `POST /api/ingest/parse-structured-data`
 
 用途：结构化解析相关入口。
 
-## 6. 文档维护要求
+## 7. 文档维护要求
 
 后续新增、删除或修改任何接口时，必须同步更新：
 

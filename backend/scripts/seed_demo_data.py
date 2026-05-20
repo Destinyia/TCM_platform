@@ -10,9 +10,14 @@ from sqlalchemy.dialects.postgresql import insert
 from backend.app.config import RULE_VERSION
 from backend.app.database import SessionLocal, get_engine
 from backend.app.models import (
+    Device,
     DatasetVersion,
+    FeatureVariable,
     FileAsset,
     ModalityRecord,
+    PulseMeasurement,
+    PulsePositionFeature,
+    PulseWaveformAsset,
     QualityEvent,
     User,
     UserDayPanel,
@@ -180,6 +185,25 @@ QUALITY_EVENTS = [
 DATASET_VERSIONS = [
     {"dataset_id": "DS-PULSE-001", "version": "v2026.05.demo.001", "task_type": "pulse_feature_analysis", "status": "ready", "samples": 8, "users": 4, "split_strategy": "by_user", "modalities": ["pulse"], "quality_policy": "exclude suspicious pulse duplicates"},
     {"dataset_id": "DS-MM-001", "version": "v2026.05.demo.002", "task_type": "multimodal_constitution", "status": "draft", "samples": 6, "users": 3, "split_strategy": "by_user", "modalities": ["ask", "pulse", "tongue", "face"], "quality_policy": "valid + incomplete with explicit missing flags"},
+]
+
+DEVICES = [
+    {"source_vendor": "zhongke", "source_device_id": "zhongke-demo-device", "device_model": "中科四诊仪 Demo", "sensor_type": "pulse_pressure", "sampling_rate": 100},
+    {"source_vendor": "yushengtang", "source_device_id": "yst-demo-device", "device_model": "玉生堂四诊仪 Demo", "sensor_type": "pulse_pressure", "sampling_rate": 100},
+]
+
+PULSE_FEATURE_VARIABLES = [
+    {"feature_name": "pulse_rate", "display_name": "脉率", "unit": "bpm", "category": "time_domain", "is_ml_feature": True},
+    {"feature_name": "force", "display_name": "脉力", "unit": None, "category": "pulse_observation", "is_ml_feature": True},
+    {"feature_name": "tension", "display_name": "紧张度", "unit": None, "category": "pulse_observation", "is_ml_feature": True},
+    {"feature_name": "fluency", "display_name": "流利度", "unit": None, "category": "pulse_observation", "is_ml_feature": True},
+    {"feature_name": "amplitude", "display_name": "幅值", "unit": None, "category": "time_domain", "is_ml_feature": True},
+    {"feature_name": "stability_score", "display_name": "稳定性评分", "unit": "score", "category": "quality", "is_ml_feature": True, "is_quality_feature": True},
+    {"feature_name": "h1", "display_name": "主波幅 h1", "unit": None, "category": "morphology", "is_ml_feature": True},
+    {"feature_name": "h3", "display_name": "重搏前波 h3", "unit": None, "category": "morphology", "is_ml_feature": True},
+    {"feature_name": "w", "display_name": "脉宽 W", "unit": None, "category": "morphology", "is_ml_feature": True},
+    {"feature_name": "as", "display_name": "收缩期面积 As", "unit": None, "category": "morphology", "is_ml_feature": True},
+    {"feature_name": "ad", "display_name": "舒张期面积 Ad", "unit": None, "category": "morphology", "is_ml_feature": True},
 ]
 
 
@@ -398,6 +422,185 @@ def seed_dataset_versions(session) -> None:
         session.execute(stmt)
 
 
+def seed_devices(session) -> dict[str, uuid.UUID]:
+    ids: dict[str, uuid.UUID] = {}
+    for item in DEVICES:
+        device_uuid = demo_uuid(f"device:{item['source_vendor']}:{item['source_device_id']}")
+        stmt = insert(Device).values(
+            device_id=device_uuid,
+            source_vendor=item["source_vendor"],
+            source_device_id=item["source_device_id"],
+            device_model=item["device_model"],
+            sensor_type=item["sensor_type"],
+            sampling_rate=item["sampling_rate"],
+            device_meta_json={"demo": True},
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["source_vendor", "source_device_id"],
+            set_={
+                "device_model": item["device_model"],
+                "sensor_type": item["sensor_type"],
+                "sampling_rate": item["sampling_rate"],
+                "device_meta_json": {"demo": True},
+            },
+        )
+        ids[item["source_vendor"]] = session.execute(stmt.returning(Device.device_id)).scalar_one()
+    return ids
+
+
+def seed_feature_variables(session) -> None:
+    for item in PULSE_FEATURE_VARIABLES:
+        stmt = insert(FeatureVariable).values(
+            feature_name=item["feature_name"],
+            display_name=item["display_name"],
+            modality_type="pulse",
+            feature_level="measurement",
+            source_vendor="standard",
+            data_type="numeric",
+            unit=item.get("unit"),
+            category=item.get("category"),
+            is_ml_feature=item.get("is_ml_feature", False),
+            is_quality_feature=item.get("is_quality_feature", False),
+            valid_range_json=item.get("valid_range_json"),
+            description="Seeded for pulse analysis phase 1 demo dataset.",
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["feature_name"],
+            set_={
+                "display_name": item["display_name"],
+                "modality_type": "pulse",
+                "feature_level": "measurement",
+                "source_vendor": "standard",
+                "data_type": "numeric",
+                "unit": item.get("unit"),
+                "category": item.get("category"),
+                "is_ml_feature": item.get("is_ml_feature", False),
+                "is_quality_feature": item.get("is_quality_feature", False),
+                "valid_range_json": item.get("valid_range_json"),
+                "description": "Seeded for pulse analysis phase 1 demo dataset.",
+            },
+        )
+        session.execute(stmt)
+
+
+def seed_pulse_analysis_phase1(
+    session,
+    user_ids: dict[str, uuid.UUID],
+    visit_ids: dict[str, uuid.UUID],
+    modality_ids: dict[tuple[str, str], uuid.UUID],
+    device_ids: dict[str, uuid.UUID],
+) -> None:
+    session.execute(delete(PulsePositionFeature))
+    session.execute(delete(PulseWaveformAsset))
+
+    visit_lookup = {item["visit_id"]: item for item in VISITS}
+    asset_by_visit_side: dict[tuple[str, str], uuid.UUID] = {}
+    asset_rows = session.execute(select(FileAsset.asset_id, FileAsset.visit_id, FileAsset.asset_type)).all()
+    reverse_visit_ids = {value: key for key, value in visit_ids.items()}
+    for asset_id, visit_uuid, asset_type in asset_rows:
+        visit_key = reverse_visit_ids.get(visit_uuid)
+        if visit_key and asset_type in {"pulse_raw_left", "pulse_raw_right"}:
+            side = "right" if asset_type.endswith("right") else "left"
+            asset_by_visit_side[(visit_key, side)] = asset_id
+
+    for record in PULSE_RECORDS:
+        visit = visit_lookup[record["visit_id"]]
+        visit_time = parse_visit_time(visit["visit_time"])
+        side = record.get("side") or "unknown"
+        source_measurement_id = record["record_id"]
+        features = {
+            key: record[key]
+            for key in ["pulse_rate", "force", "tension", "fluency", "amplitude", "h1", "h3", "w", "as", "ad", "stability_score"]
+            if key in record
+        }
+        measurement_uuid = demo_uuid(f"pulse-measurement:{record['record_id']}")
+        stmt = insert(PulseMeasurement).values(
+            measurement_id=measurement_uuid,
+            visit_id=visit_ids[record["visit_id"]],
+            modality_record_id=modality_ids[(record["visit_id"], "pulse")],
+            user_id=user_ids[visit["user_id"]],
+            device_id=device_ids.get(visit["source_vendor"]),
+            source_vendor=visit["source_vendor"],
+            source_measurement_id=source_measurement_id,
+            start_time=visit_time,
+            duration_seconds=60,
+            visit_slot=visit["slot"],
+            collection_hour=visit_time.hour + visit_time.minute / 60,
+            hand_side=side,
+            pulse_position="overall",
+            sampling_rate=100,
+            quality_status=visit["quality_status"],
+            source_meta_json={
+                "demo_record_id": record["record_id"],
+                "pulse_type": record.get("pulse_type"),
+                "included": record.get("included", True),
+            },
+            feature_json=features,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["modality_record_id", "source_measurement_id"],
+            set_={
+                "visit_id": visit_ids[record["visit_id"]],
+                "user_id": user_ids[visit["user_id"]],
+                "device_id": device_ids.get(visit["source_vendor"]),
+                "start_time": visit_time,
+                "duration_seconds": 60,
+                "visit_slot": visit["slot"],
+                "collection_hour": visit_time.hour + visit_time.minute / 60,
+                "hand_side": side,
+                "pulse_position": "overall",
+                "sampling_rate": 100,
+                "quality_status": visit["quality_status"],
+                "source_meta_json": {
+                    "demo_record_id": record["record_id"],
+                    "pulse_type": record.get("pulse_type"),
+                    "included": record.get("included", True),
+                },
+                "feature_json": features,
+            },
+        )
+        actual_measurement_id = session.execute(stmt.returning(PulseMeasurement.measurement_id)).scalar_one()
+
+        asset_id = asset_by_visit_side.get((record["visit_id"], side))
+        waveform_stmt = insert(PulseWaveformAsset).values(
+            waveform_asset_id=demo_uuid(f"pulse-waveform:{record['record_id']}:overall"),
+            measurement_id=actual_measurement_id,
+            asset_id=asset_id,
+            channel_name="demo_preview",
+            hand_side=side,
+            pulse_position="overall",
+            sample_count=6000,
+            sampling_rate=100,
+            storage_uri=f"demo://pulse/waveforms/{record['record_id']}.npz",
+            data_format="npz",
+            file_hash=f"demo_waveform_hash_{record['record_id']}",
+            preview_json=[
+                {"x": 0, "y": record["amplitude"] * 0.2},
+                {"x": 0.25, "y": record["amplitude"]},
+                {"x": 0.5, "y": record["amplitude"] * 0.45},
+                {"x": 0.75, "y": record["amplitude"] * 0.65},
+                {"x": 1.0, "y": record["amplitude"] * 0.25},
+            ],
+            summary_json={"min": 0, "max": record["amplitude"], "mean": record["amplitude"] * 0.45},
+        )
+        session.execute(waveform_stmt)
+
+        for feature_name in ["h1", "h3", "w", "as", "ad"]:
+            position_stmt = insert(PulsePositionFeature).values(
+                position_feature_id=demo_uuid(f"pulse-position:{record['record_id']}:overall:{feature_name}"),
+                measurement_id=actual_measurement_id,
+                hand_side=side,
+                pulse_position="overall",
+                feature_name=feature_name,
+                feature_value=record.get(feature_name),
+                feature_unit=None,
+                source_field=feature_name,
+                parser_version="demo_pulse_phase1_v1",
+                quality_weight=record.get("stability_score", 0) / 100,
+            )
+            session.execute(position_stmt)
+
+
 def seed_panels(session, user_ids: dict[str, uuid.UUID], visit_ids: dict[str, uuid.UUID]) -> None:
     by_user_date_slot: dict[tuple[str, date, str], list[dict]] = defaultdict(list)
     for visit in VISITS:
@@ -444,6 +647,9 @@ def main() -> None:
         seed_assets(session, visit_ids, modality_ids)
         seed_quality_events(session, visit_ids)
         seed_dataset_versions(session)
+        device_ids = seed_devices(session)
+        seed_feature_variables(session)
+        seed_pulse_analysis_phase1(session, user_ids, visit_ids, modality_ids, device_ids)
         seed_panels(session, user_ids, visit_ids)
         session.commit()
     print("Seeded static demo data into PostgreSQL.")
