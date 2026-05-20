@@ -1,4 +1,11 @@
-export const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
+function defaultApiBase() {
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    return `${window.location.protocol}//${window.location.hostname}:5000`
+  }
+  return 'http://localhost:5000'
+}
+
+export const API_BASE = import.meta.env.VITE_API_BASE || defaultApiBase()
 
 export async function fetchJson(path, params = {}) {
   const url = new URL(path, API_BASE)

@@ -9,6 +9,7 @@ import pandas as pd
 
 from backend.app.config import STORAGE_ROOT, STORAGE_URI_PREFIX
 from backend.app.models import FileAsset, Visit
+from backend.app.pulse_parser import build_pulse_records, parse_zhongke_pulse_excel, yushengtang_record
 
 MAX_LIST_ITEMS = 6
 MAX_DICT_KEYS = 40
@@ -85,6 +86,12 @@ def compact_value(value: Any) -> Any:
             "sample": [compact_value(item) for item in value[:MAX_LIST_ITEMS]],
         }
     if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in {"[", "{"}:
+            try:
+                return compact_value(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
         return value if len(value) <= MAX_TEXT_LEN else value[:MAX_TEXT_LEN] + "..."
     return json_safe(value)
 
@@ -179,9 +186,20 @@ def parse_asset(asset: FileAsset, visit: Visit) -> dict[str, Any]:
     try:
         suffix = path.suffix.lower()
         if suffix == ".json":
-            return {**base, "parse_status": "ok", "structured": parse_json_asset(path)}
+            structured = parse_json_asset(path)
+            if asset.asset_type == "pulse_json":
+                raw_payload = json.loads(read_text_relaxed(path))
+                if isinstance(raw_payload, dict):
+                    structured["pulse_record"] = yushengtang_record(base, raw_payload, visit)
+            return {**base, "parse_status": "ok", "structured": structured}
         if suffix in {".xls", ".xlsx"}:
-            return {**base, "parse_status": "ok", "structured": parse_excel_asset(path, visit)}
+            structured = parse_excel_asset(path, visit)
+            if asset.asset_type == "source_excel" and "脉诊" in (asset.file_name or ""):
+                pulse_record = parse_zhongke_pulse_excel(path, visit)
+                structured["parser"] = "zhongke_pulse_excel" if pulse_record else structured.get("parser")
+                if pulse_record:
+                    structured["pulse_record"] = pulse_record
+            return {**base, "parse_status": "ok", "structured": structured}
         return {
             **base,
             "parse_status": "metadata_only",
@@ -198,6 +216,16 @@ def parse_asset(asset: FileAsset, visit: Visit) -> dict[str, Any]:
 def infer_modality(asset: FileAsset) -> str:
     if asset.asset_type in {"source_json"} and asset.file_name == "dataAsk.json":
         return "ask"
+    if asset.asset_type == "source_excel":
+        file_name = asset.file_name or ""
+        if "问诊" in file_name:
+            return "ask"
+        if "脉诊" in file_name:
+            return "pulse"
+        if "舌诊" in file_name:
+            return "tongue"
+        if "面诊" in file_name:
+            return "face"
     if asset.asset_type in {"pulse_json", "pulse_image"}:
         return "pulse"
     if asset.asset_type in {"tongue_json", "tongue_origin", "tongue_image"}:
@@ -227,9 +255,12 @@ def build_structured_modalities(
     result = {}
     for modality, modality_assets in grouped.items():
         parsed_assets = [parse_asset(asset, visit) for asset in modality_assets]
-        result[modality] = {
+        modality_payload = {
             "source_vendor": visit.source_vendor,
             "asset_count": len(modality_assets),
             "assets": parsed_assets,
         }
+        if modality == "pulse":
+            modality_payload["records"] = build_pulse_records(visit, parsed_assets)
+        result[modality] = modality_payload
     return result

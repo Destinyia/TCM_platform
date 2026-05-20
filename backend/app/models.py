@@ -155,6 +155,26 @@ class UserDayPanel(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class VisitFeatureWide(Base):
+    __tablename__ = "mart_visit_feature_wide"
+
+    visit_id = Column(UUID(as_uuid=True), ForeignKey("fact_visit.visit_id"), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("dim_user.user_id"), nullable=False)
+    source_vendor = Column(Text, nullable=False)
+    source_visit_id = Column(Text, nullable=False)
+    source_record_group_id = Column(Text)
+    visit_time = Column(DateTime(timezone=True))
+    visit_date = Column(Date)
+    visit_slot = Column(Text)
+    quality_status = Column(Text)
+    modalities = Column(JSONB, nullable=False, default=list)
+    feature_json = Column(JSONB, nullable=False, default=dict)
+    feature_groups_json = Column(JSONB, nullable=False, default=dict)
+    feature_count = Column(Integer, nullable=False, default=0)
+    parser_version = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class QualityEvent(Base):
     __tablename__ = "fact_quality_event"
 

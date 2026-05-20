@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.app.feature_wide import rebuild_visit_feature_wide
 from backend.app.models import FileAsset, ModalityRecord, Visit
 from backend.app.structured_parser import build_structured_modalities
 
@@ -92,6 +93,7 @@ def parse_structured_data(session: Session, payload: dict[str, Any] | None = Non
         "assets_metadata_only": 0,
         "assets_failed": 0,
         "assets_missing_file": 0,
+        "feature_wide_rows": 0,
     }
 
     for visit in visits:
@@ -134,4 +136,5 @@ def parse_structured_data(session: Session, payload: dict[str, Any] | None = Non
             result["visits_parsed"] += 1
             result["modalities_updated"] += updated_this_visit
 
+    result["feature_wide_rows"] = rebuild_visit_feature_wide(session, visits)
     return result

@@ -29,6 +29,7 @@ logs/
 /datasets/
 *.sqlite
 *.db
+*.dump
 postgres-data/
 pgdata/
 

@@ -7,10 +7,11 @@ from uuid import UUID
 
 from flask import Blueprint, abort, jsonify, request, send_file
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.config import STORAGE_ROOT, STORAGE_URI_PREFIX
 from backend.app.database import SessionLocal, get_engine
-from backend.app.models import DatasetVersion, FileAsset, ModalityRecord, QualityEvent, User, UserDayPanel, Visit
+from backend.app.models import DatasetVersion, FileAsset, ModalityRecord, QualityEvent, User, UserDayPanel, Visit, VisitFeatureWide
 
 demo_api = Blueprint("demo_api", __name__)
 
@@ -403,9 +404,23 @@ def visit_detail(visit_id: str):
         assets = session.execute(
             select(FileAsset).where(FileAsset.visit_id == visit.visit_id).order_by(FileAsset.asset_type)
         ).scalars().all()
-    return jsonify(
-        {
+        try:
+            feature_wide = session.get(VisitFeatureWide, visit.visit_id)
+        except SQLAlchemyError:
+            session.rollback()
+            feature_wide = None
+
+        response_payload = {
             **visit_payload(visit, user, [item.modality_type for item in modalities if item.exists_flag]),
+            "feature_wide": {
+                "feature_count": feature_wide.feature_count,
+                "parser_version": feature_wide.parser_version,
+                "updated_at": feature_wide.updated_at.isoformat() if feature_wide.updated_at else None,
+                "features": feature_wide.feature_json,
+                "groups": feature_wide.feature_groups_json,
+            }
+            if feature_wide
+            else None,
             "modality_records": [
                 {
                     "modality_record_id": str(item.modality_record_id),
@@ -435,7 +450,7 @@ def visit_detail(visit_id: str):
                 for asset in assets
             ],
         }
-    )
+    return jsonify(response_payload)
 
 
 @demo_api.route("/assets/<asset_id>/file", methods=["GET"])

@@ -24,6 +24,7 @@ def run_sql_files() -> None:
         SQL_DIR / "001_initial_multimodal_schema.sql",
         SQL_DIR / "002_name_alias_rule.sql",
         SQL_DIR / "003_demo_support.sql",
+        SQL_DIR / "004_visit_feature_wide.sql",
     ]
     with get_engine().begin() as conn:
         for path in sql_files:
