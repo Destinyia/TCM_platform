@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import ProgrammingError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -19,6 +20,7 @@ from backend.app.database import SessionLocal, get_engine
 from backend.app.models import (
     Device,
     FeatureVariable,
+    ModalityRecord,
     PulseMeasurement,
     PulsePositionFeature,
     PulseWaveformAsset,
@@ -29,6 +31,7 @@ from backend.app.models import (
 
 DEFAULT_DATASET_ID = "DS-PULSE-PHASE1"
 DEFAULT_VERSION = "v2026.05.phase1.001"
+QUALITY_FEATURE_NAMES = {"stability_score", "signal_quality_score", "artifact_ratio"}
 
 
 def json_default(value: Any) -> Any:
@@ -80,16 +83,27 @@ def sha256_file(path: Path) -> str:
 def load_measurements() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     get_engine()
     with SessionLocal() as session:
-        measurement_rows = session.execute(
-            select(PulseMeasurement, Visit, User, Device)
-            .join(Visit, Visit.visit_id == PulseMeasurement.visit_id)
-            .join(User, User.user_id == PulseMeasurement.user_id)
-            .outerjoin(Device, Device.device_id == PulseMeasurement.device_id)
-            .order_by(PulseMeasurement.start_time, PulseMeasurement.measurement_id)
-        ).all()
-        waveform_rows = session.execute(select(PulseWaveformAsset).order_by(PulseWaveformAsset.measurement_id, PulseWaveformAsset.channel_name)).scalars().all()
-        position_rows = session.execute(select(PulsePositionFeature).order_by(PulsePositionFeature.measurement_id, PulsePositionFeature.pulse_position, PulsePositionFeature.feature_name)).scalars().all()
-        variable_rows = session.execute(select(FeatureVariable).where(FeatureVariable.modality_type == "pulse").order_by(FeatureVariable.feature_name)).scalars().all()
+        try:
+            measurement_rows = session.execute(
+                select(PulseMeasurement, Visit, User, Device)
+                .join(Visit, Visit.visit_id == PulseMeasurement.visit_id)
+                .join(User, User.user_id == PulseMeasurement.user_id)
+                .outerjoin(Device, Device.device_id == PulseMeasurement.device_id)
+                .order_by(PulseMeasurement.start_time, PulseMeasurement.measurement_id)
+            ).all()
+            waveform_rows = session.execute(select(PulseWaveformAsset).order_by(PulseWaveformAsset.measurement_id, PulseWaveformAsset.channel_name)).scalars().all()
+            position_rows = session.execute(select(PulsePositionFeature).order_by(PulsePositionFeature.measurement_id, PulsePositionFeature.pulse_position, PulsePositionFeature.feature_name)).scalars().all()
+            variable_rows = session.execute(select(FeatureVariable).where(FeatureVariable.modality_type == "pulse").order_by(FeatureVariable.feature_name)).scalars().all()
+        except ProgrammingError as exc:
+            session.rollback()
+            if "fact_pulse_measurement" not in str(exc):
+                raise
+            return load_measurements_from_records(session)
+
+        if not measurement_rows:
+            fallback = load_measurements_from_records(session)
+            if fallback[0]:
+                return fallback
 
     measurements: list[dict[str, Any]] = []
     features: list[dict[str, Any]] = []
@@ -184,6 +198,136 @@ def load_measurements() -> tuple[list[dict[str, Any]], list[dict[str, Any]], lis
             "description": item.description,
         }
         for item in variable_rows
+    ]
+    return measurements, features, waveforms, position_features, variables
+
+
+def load_measurements_from_records(session) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    rows = session.execute(
+        select(ModalityRecord, Visit, User)
+        .join(Visit, Visit.visit_id == ModalityRecord.visit_id)
+        .join(User, User.user_id == Visit.user_id)
+        .where(ModalityRecord.modality_type == "pulse", ModalityRecord.exists_flag.is_(True))
+        .order_by(Visit.visit_time, ModalityRecord.modality_record_id)
+    ).all()
+
+    measurements: list[dict[str, Any]] = []
+    features: list[dict[str, Any]] = []
+    waveforms: list[dict[str, Any]] = []
+    position_features: list[dict[str, Any]] = []
+    observed_features: set[str] = set()
+
+    for modality, visit, _user in rows:
+        payload = modality.parsed_structured_data_json or {}
+        for index, record in enumerate(payload.get("records") or [], start=1):
+            source_measurement_id = str(record.get("record_id") or record.get("source_measurement_id") or f"{modality.modality_record_id}:{index}")
+            measurement_id = f"{modality.modality_record_id}:{source_measurement_id}"
+            hand_side = record.get("side") or record.get("hand_side")
+            device_id = record.get("device_id") or f"{visit.source_vendor}:unknown"
+            measurements.append(
+                {
+                    "measurement_id": measurement_id,
+                    "sample_id": f"pulse-{measurement_id}",
+                    "visit_id": str(visit.visit_id),
+                    "modality_record_id": str(modality.modality_record_id),
+                    "user_id": str(visit.user_id),
+                    "user_display_id": f"DEID-{str(visit.user_id)[:8]}",
+                    "source_vendor": visit.source_vendor,
+                    "source_measurement_id": source_measurement_id,
+                    "source_visit_id": visit.source_visit_id,
+                    "start_time": visit.visit_time,
+                    "duration_seconds": record.get("duration_seconds"),
+                    "visit_slot": visit.visit_slot,
+                    "collection_hour": (visit.visit_time.hour + visit.visit_time.minute / 60) if visit.visit_time else None,
+                    "hand_side": hand_side,
+                    "pulse_position": record.get("pulse_position") or "overall",
+                    "device_id": device_id,
+                    "device_model": record.get("device_model"),
+                    "source_device_id": record.get("source_device_id") or "unknown",
+                    "sampling_rate": record.get("sampling_rate"),
+                    "quality_status": visit.quality_status,
+                    "quality_flags": (visit.cheat_types or {}).get("flags") or [],
+                }
+            )
+
+            for key, value in record.items():
+                if isinstance(value, (int, float)) and key not in {"duration_seconds", "sampling_rate"}:
+                    observed_features.add(key)
+                    features.append(
+                        {
+                            "measurement_id": measurement_id,
+                            "visit_id": str(visit.visit_id),
+                            "user_id": str(visit.user_id),
+                            "source_vendor": visit.source_vendor,
+                            "device_id": device_id,
+                            "feature_level": "measurement",
+                            "feature_name": key,
+                            "feature_value": value,
+                        }
+                    )
+
+            preview = record.get("waveform_preview") or []
+            summary = record.get("waveform_summary") or {}
+            if preview or summary:
+                waveforms.append(
+                    {
+                        "waveform_asset_id": f"{measurement_id}:preview",
+                        "measurement_id": measurement_id,
+                        "asset_id": None,
+                        "channel_name": "waveform_preview",
+                        "hand_side": hand_side,
+                        "pulse_position": record.get("pulse_position") or "overall",
+                        "sample_count": summary.get("sample_count") if isinstance(summary, dict) else None,
+                        "sampling_rate": record.get("sampling_rate"),
+                        "storage_uri": None,
+                        "data_format": "json_preview",
+                        "file_hash": None,
+                        "preview_json": preview,
+                        "summary_json": summary,
+                    }
+                )
+
+            for measurement_item in record.get("measurements") or []:
+                if not isinstance(measurement_item, dict):
+                    continue
+                position = measurement_item.get("position") or measurement_item.get("pulse_position") or "unknown"
+                item_side = measurement_item.get("side") or measurement_item.get("hand_side") or hand_side
+                for key, value in measurement_item.items():
+                    if key in {"position", "pulse_position", "side", "hand_side"}:
+                        continue
+                    if isinstance(value, (int, float, str)):
+                        position_features.append(
+                            {
+                                "position_feature_id": f"{measurement_id}:{position}:{key}",
+                                "measurement_id": measurement_id,
+                                "hand_side": item_side,
+                                "pulse_position": position,
+                                "feature_name": key,
+                                "feature_value": value if isinstance(value, (int, float)) else None,
+                                "feature_text": value if isinstance(value, str) else None,
+                                "feature_unit": None,
+                                "source_field": key,
+                                "parser_version": record.get("parser_version"),
+                                "quality_weight": record.get("stability_score"),
+                            }
+                        )
+
+    variables = [
+        {
+            "feature_name": name,
+            "display_name": name,
+            "modality_type": "pulse",
+            "feature_level": "measurement",
+            "source_vendor": "standard",
+            "data_type": "numeric",
+            "unit": None,
+            "category": "quality" if name in QUALITY_FEATURE_NAMES else "unknown",
+            "is_ml_feature": name not in QUALITY_FEATURE_NAMES,
+            "is_quality_feature": name in QUALITY_FEATURE_NAMES,
+            "valid_range_json": None,
+            "description": "Inferred from parsed pulse records fallback export.",
+        }
+        for name in sorted(observed_features)
     ]
     return measurements, features, waveforms, position_features, variables
 
