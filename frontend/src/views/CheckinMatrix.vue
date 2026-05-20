@@ -5,7 +5,7 @@
         <div class="header-row">
           <div>
             <div class="title">打卡矩阵</div>
-            <div class="subtitle">按用户、日期、早中晚时段查看打卡覆盖、来源和质量状态。</div>
+            <div class="subtitle">按用户和日期查看聚合后的打卡次数、有效性和来源。</div>
           </div>
           <el-space>
             <el-select v-model="selectedMonth" placeholder="月份" class="month-select" @change="loadMatrix">
@@ -20,58 +20,36 @@
       </template>
 
       <div v-loading="loading" class="matrix-body">
-        <div v-if="viewMode === 'thumbnail'" class="thumbnail-grid" :style="thumbnailStyle">
-          <div v-for="row in matrix.rows" :key="row.user_id" class="user-strip">
-            <div class="strip-name">{{ row.user_name }}</div>
-            <div class="strip-cells">
-              <template v-for="date in matrix.dates" :key="date">
+        <div class="matrix-viewport">
+          <div class="date-matrix" :class="`date-matrix--${viewMode}`" :style="matrixGridStyle">
+            <div class="matrix-header user-header">用户</div>
+            <div v-for="date in matrix.dates" :key="date" class="matrix-header date-header">{{ date }}</div>
+
+            <template v-for="row in matrixRows" :key="row.user_id">
+              <router-link class="user-cell" :to="`/patients/${row.user_id}`">
+                <span class="user-name">{{ row.user_name }}</span>
+                <span class="user-id">{{ row.display_id }}</span>
+              </router-link>
+              <div v-for="date in matrix.dates" :key="`${row.user_id}-${date}`">
                 <div
-                  v-for="slot in matrix.slots"
-                  :key="`${row.user_id}-${date}-${slot}`"
-                  class="mini-cell"
-                  :class="miniCellClass(matrixCell(row, date, slot))"
-                  :title="cellTitle(row, date, slot)"
-                />
-              </template>
-            </div>
+                  v-if="matrixCell(row, date)"
+                  class="matrix-cell"
+                  :class="cellClass(matrixCell(row, date))"
+                  :title="cellTitle(row, date)"
+                >
+                  <span class="cell-count">{{ matrixCell(row, date).count }}</span>
+                  <span class="cell-status">{{ cellStatusName(matrixCell(row, date)) }}</span>
+                  <span class="cell-source">{{ sourceLabels(matrixCell(row, date).sources) }}</span>
+                </div>
+                <div v-else class="matrix-cell cell-empty" :title="cellTitle(row, date)">
+                  <span class="cell-count">0</span>
+                  <span class="cell-status">无效</span>
+                  <span class="cell-source">-</span>
+                </div>
+              </div>
+            </template>
           </div>
         </div>
-
-        <el-table
-          v-else
-          :data="matrix.rows"
-          size="small"
-          border
-          class="matrix-table"
-          height="calc(100vh - 236px)"
-        >
-          <el-table-column prop="display_id" label="脱敏ID" width="96" fixed />
-          <el-table-column prop="user_name" label="用户" width="100" fixed />
-          <el-table-column prop="total_count" label="次数" width="72" fixed />
-          <el-table-column v-for="date in matrix.dates" :key="date" :label="date" align="center">
-            <el-table-column
-              v-for="slot in matrix.slots"
-              :key="`${date}-${slot}`"
-              :label="slot"
-              width="126"
-              align="center"
-            >
-              <template #default="{ row }">
-                <div v-if="matrixCell(row, date, slot)" class="matrix-cell" :class="cellClass(matrixCell(row, date, slot))">
-                  <div class="cell-top">
-                    <span class="cell-count">{{ matrixCell(row, date, slot).count }}</span>
-                    <el-tag size="small" :type="cellQualityType(matrixCell(row, date, slot))">
-                      {{ cellQualityName(matrixCell(row, date, slot)) }}
-                    </el-tag>
-                  </div>
-                  <div class="cell-meta">{{ matrixCell(row, date, slot).sources.map(sourceName).join('/') }}</div>
-                  <div class="cell-modalities">{{ matrixCell(row, date, slot).modalities.map(modalityName).join('、') }}</div>
-                </div>
-                <span v-else class="empty-cell">-</span>
-              </template>
-            </el-table-column>
-          </el-table-column>
-        </el-table>
       </div>
     </el-card>
   </div>
@@ -92,21 +70,21 @@ const matrix = ref({
   summary: {}
 })
 
-const modalityLabels = {
-  ask: '问诊',
-  pulse: '脉诊',
-  tongue: '舌诊',
-  face: '面诊',
-  voice: '声诊',
-  report: '报告'
-}
-
-const thumbnailStyle = computed(() => {
-  const columns = Math.max(1, matrix.value.dates.length * matrix.value.slots.length)
+const matrixGridStyle = computed(() => {
+  const columns = Math.max(1, matrix.value.dates.length)
   return {
-    '--matrix-columns': columns
+    '--date-columns': columns
   }
 })
+
+const matrixRows = computed(() => matrix.value.rows.map((row) => {
+  const dateCells = {}
+  matrix.value.dates.forEach((date) => {
+    const cell = aggregateDateCell(row, date)
+    if (cell) dateCells[date] = cell
+  })
+  return { ...row, date_cells: dateCells }
+}))
 
 async function loadMatrix() {
   loading.value = true
@@ -123,39 +101,52 @@ async function loadMatrix() {
   }
 }
 
-function matrixCell(row, date, slot) {
-  return row.cells?.[date]?.[slot]
+function matrixCell(row, date) {
+  return row.date_cells?.[date] || null
 }
 
-function miniCellClass(cell) {
-  if (!cell) return 'mini-empty'
-  return `mini-${cell.status}`
+function aggregateDateCell(row, date) {
+  const slotCells = row.cells?.[date]
+  if (!slotCells) return null
+
+  const merged = {
+    count: 0,
+    valid_count: 0,
+    sources: [],
+    visit_ids: []
+  }
+  Object.values(slotCells).forEach((cell) => {
+    merged.count += cell.count || 0
+    merged.valid_count += cell.valid_count || 0
+    ;(cell.sources || []).forEach((source) => {
+      if (!merged.sources.includes(source)) merged.sources.push(source)
+    })
+    ;(cell.visit_ids || []).forEach((visitId) => merged.visit_ids.push(visitId))
+  })
+
+  if (!merged.count) return null
+  merged.sources.sort()
+  merged.status = merged.count === merged.valid_count ? 'valid' : 'invalid'
+  return merged
 }
 
-function cellTitle(row, date, slot) {
-  const cell = matrixCell(row, date, slot)
-  if (!cell) return `${row.user_name} ${date} ${slot}: 无`
-  return `${row.user_name} ${date} ${slot}: ${cell.count} 次 ${cell.sources.map(sourceName).join('/')}`
+function cellTitle(row, date) {
+  const cell = matrixCell(row, date)
+  if (!cell) return `${row.user_name} ${date}: 0 次 无效 -`
+  return `${row.user_name} ${date}: ${cell.count} 次 ${cellStatusName(cell)} ${sourceLabels(cell.sources)}`
 }
 
 function sourceName(value) {
   return value === 'zhongke' ? '中科' : value === 'yushengtang' ? '玉生堂' : value
 }
 
-function modalityName(value) {
-  return modalityLabels[value] || value
+function sourceLabels(sources = []) {
+  const labels = sources.map(sourceName).filter(Boolean)
+  return labels.length ? labels.join('/') : '-'
 }
 
-function cellQualityName(cell) {
-  if (cell.status === 'valid') return '有效'
-  if (cell.status === 'mixed') return '混合'
-  return '异常'
-}
-
-function cellQualityType(cell) {
-  if (cell.status === 'valid') return 'success'
-  if (cell.status === 'mixed') return 'warning'
-  return 'danger'
+function cellStatusName(cell) {
+  return cell.status === 'valid' ? '有效' : '无效'
 }
 
 function cellClass(cell) {
@@ -194,87 +185,144 @@ onMounted(loadMatrix)
 .matrix-body {
   min-height: calc(100vh - 220px);
 }
-.thumbnail-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.matrix-viewport {
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
   height: calc(100vh - 236px);
   overflow: auto;
 }
-.user-strip {
-  align-items: stretch;
+.date-matrix {
   display: grid;
-  gap: 8px;
-  grid-template-columns: 96px 1fr;
-  min-height: 24px;
+  gap: 1px;
+  grid-template-columns: 136px repeat(var(--date-columns), minmax(108px, 1fr));
+  min-width: max-content;
 }
-.strip-name {
-  color: #303133;
+.date-matrix--thumbnail {
+  grid-template-columns: 112px repeat(var(--date-columns), minmax(76px, 1fr));
+}
+.matrix-header {
+  align-items: center;
+  background: #f5f7fa;
+  color: #606266;
+  display: flex;
   font-size: 12px;
   font-weight: 700;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.user-header {
+  left: 0;
+  justify-content: flex-start;
+  z-index: 3;
+}
+.date-header {
+  white-space: nowrap;
+}
+.user-cell {
+  align-items: flex-start;
+  background: #fff;
+  color: #303133;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  font-weight: 700;
+  justify-content: center;
+  left: 0;
+  min-height: 58px;
+  padding: 8px;
+  position: sticky;
+  text-decoration: none;
+  z-index: 1;
+}
+.date-matrix--thumbnail .user-cell {
+  min-height: 40px;
+  padding: 6px;
+}
+.user-cell:hover .user-name {
+  color: #409eff;
+}
+.user-name {
+  line-height: 1.3;
+  max-width: 100%;
   overflow: hidden;
-  padding-top: 2px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.strip-cells {
-  display: grid;
-  gap: 2px;
-  grid-template-columns: repeat(var(--matrix-columns), minmax(4px, 1fr));
-}
-.mini-cell {
-  border-radius: 2px;
-  min-height: 20px;
-}
-.mini-empty {
-  background: #edf0f3;
-}
-.mini-valid {
-  background: #45b36b;
-}
-.mini-mixed {
-  background: #e6a23c;
-}
-.mini-invalid {
-  background: #d9534f;
-}
-.matrix-table {
-  width: 100%;
+.user-id {
+  color: #909399;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  margin-top: 2px;
 }
 .matrix-cell {
-  border-radius: 4px;
-  min-height: 74px;
+  align-items: center;
+  background: #fff;
+  display: grid;
+  gap: 2px;
+  grid-template-rows: 1fr auto auto;
+  justify-items: center;
+  min-height: 58px;
   padding: 6px;
-  text-align: left;
+  text-align: center;
+}
+.date-matrix--thumbnail .matrix-cell {
+  gap: 1px;
+  min-height: 40px;
+  padding: 4px;
 }
 .cell-valid {
   background: #edf8f2;
 }
-.cell-mixed {
-  background: #fff7e8;
-}
 .cell-invalid {
   background: #fef0f0;
 }
-.cell-top {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
+.cell-empty {
+  background: #f7f9fb;
 }
 .cell-count {
   color: #1f4f4c;
   font-size: 18px;
   font-weight: 700;
+  line-height: 1;
 }
-.cell-meta,
-.cell-modalities {
+.date-matrix--thumbnail .cell-count {
+  font-size: 14px;
+}
+.cell-status,
+.cell-source {
   color: #606266;
-  font-size: 12px;
-  line-height: 1.35;
-  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   word-break: break-all;
 }
-.empty-cell {
+.cell-valid .cell-status {
+  color: #2f8f52;
+}
+.cell-invalid .cell-status,
+.cell-empty .cell-status {
+  color: #c45656;
+}
+.cell-empty .cell-count,
+.cell-empty .cell-source {
   color: #a8abb2;
+}
+@media (max-width: 900px) {
+  .header-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .date-matrix,
+  .date-matrix--thumbnail {
+    grid-template-columns: 104px repeat(var(--date-columns), minmax(72px, 1fr));
+  }
 }
 </style>
