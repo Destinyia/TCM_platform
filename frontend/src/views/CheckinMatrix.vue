@@ -41,11 +41,7 @@
                   <span class="cell-status">{{ cellStatusName(matrixCell(row, date)) }}</span>
                   <span class="cell-source">{{ sourceLabels(matrixCell(row, date).sources) }}</span>
                 </div>
-                <div v-else class="matrix-cell cell-empty" :title="cellTitle(row, date)">
-                  <span class="cell-count">0</span>
-                  <span class="cell-status">无效</span>
-                  <span class="cell-source">-</span>
-                </div>
+                <div v-else class="matrix-cell cell-empty" :title="cellTitle(row, date)" />
               </div>
             </template>
           </div>
@@ -132,7 +128,7 @@ function aggregateDateCell(row, date) {
 
 function cellTitle(row, date) {
   const cell = matrixCell(row, date)
-  if (!cell) return `${row.user_name} ${date}: 0 次 无效 -`
+  if (!cell) return `${row.user_name} ${date}: 无打卡`
   return `${row.user_name} ${date}: ${cell.count} 次 ${cellStatusName(cell)} ${sourceLabels(cell.sources)}`
 }
 
