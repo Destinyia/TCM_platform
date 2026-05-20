@@ -212,7 +212,7 @@ Query：
 
 ## 4. 脉诊分析 API
 
-当前 `/api/demo/pulse/*` 仍是展示型 demo API。脉诊分析模块作为数据平台下游任务时，需要进一步提供 analysis-ready 数据集、manifest、波形资产、设备信息和分析结果回写接口。详细接口约束见 `docs/脉诊分析下游闭环接口需求.md`。
+当前 `/api/demo/pulse/*` 仍是展示型 demo API。脉诊分析模块与数据平台保持低耦合，平台长期对外契约应是通用数据集下载、manifest、脱敏和审计能力，而不是绑定脉诊专用 analysis-ready API。详细边界见 `docs/脉诊分析下游闭环接口需求.md`。
 
 ### 4.1 `GET /api/demo/pulse/records`
 
@@ -258,9 +258,9 @@ Query：
 | --- | --- |
 | `user_id` | 可选 |
 
-## 5. 脉诊 analysis-ready API
+## 5. 脉诊模块辅助 API
 
-一阶段新增独立蓝图，注册前缀 `/api/pulse`。这些接口面向下游脉诊可信度分析，不替代 `/api/demo/pulse/*` 展示接口。
+一阶段新增独立蓝图，注册前缀 `/api/pulse`。这些接口用于当前脉诊研究模块的本地验证和样本检查，不是数据平台面向独立研究者的通用下载契约。未来独立研究者应优先通过通用数据集下载接口获取版本化数据包。
 
 ### 5.1 `GET /api/pulse/measurements`
 
@@ -324,17 +324,58 @@ Query：
 
 返回字段来自 `dim_feature_variable`，包括变量名、中文名、模态、粒度、数据类型、单位、类别、是否可进入机器学习、是否质量字段和合理范围。
 
-## 6. Ingest API
+## 6. 通用数据集下载 API（规划）
 
-### 6.1 `POST /api/ingest/standard-storage`
+平台应提供模态无关的研究数据下载能力，供脉诊、舌诊、面诊、声诊、多模态融合等独立研究者使用。
+
+规划接口：
+
+```text
+POST /api/datasets
+POST /api/datasets/{dataset_id}/versions
+GET  /api/datasets/{dataset_id}/versions
+GET  /api/datasets/{dataset_id}/versions/{version_id}
+GET  /api/datasets/{dataset_id}/versions/{version_id}/manifest
+GET  /api/datasets/{dataset_id}/versions/{version_id}/files
+GET  /api/datasets/{dataset_id}/versions/{version_id}/artifact
+```
+
+通用下载包建议包含：
+
+| 文件 | 说明 |
+| --- | --- |
+| `dataset_card.md` | 数据集说明、用途、限制、脱敏策略 |
+| `manifest.jsonl` | 样本级索引，包含 `sample_id`、`user_id`、`visit_id`、模态、资产、质量字段 |
+| `visits.parquet` | visit 级元数据 |
+| `modality_records.parquet` | 模态记录与结构化 records |
+| `feature_wide.parquet` | visit 级宽表 |
+| `feature_variables.parquet` | 变量字典 |
+| `assets_manifest.jsonl` | 文件资产索引，不直接暴露原始绝对路径 |
+| `files/` | 按权限策略打包的原始或标准化资产 |
+
+通用过滤条件应至少支持：
+
+| 参数 | 说明 |
+| --- | --- |
+| `modalities` | 模态集合，如 `pulse/tongue/face/voice/ask` |
+| `source_vendor` | 来源平台 |
+| `date_range` | 日期范围 |
+| `quality_policy` | 质量过滤策略 |
+| `asset_policy` | 是否包含文件资产、预览、原始文件 |
+| `deidentify` | 是否脱敏，研究导出默认 true |
+| `format` | `jsonl/parquet/csv/zip` |
+
+## 7. Ingest API
+
+### 7.1 `POST /api/ingest/standard-storage`
 
 用途：标准化本地存储相关入口。
 
-### 6.2 `POST /api/ingest/parse-structured-data`
+### 7.2 `POST /api/ingest/parse-structured-data`
 
 用途：结构化解析相关入口。
 
-## 7. 文档维护要求
+## 8. 文档维护要求
 
 后续新增、删除或修改任何接口时，必须同步更新：
 
