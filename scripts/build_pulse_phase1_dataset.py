@@ -412,7 +412,7 @@ def write_dataset_card(path: Path, dataset_id: str, version: str, summary: dict[
     )
 
 
-def build_dataset(output_dir: Path, dataset_id: str, version: str) -> None:
+def build_dataset(output_dir: Path, dataset_id: str, version: str) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     measurements, features, waveforms, position_features, variables = load_measurements()
     manifest = build_manifest(measurements, features, waveforms, position_features)
@@ -456,6 +456,25 @@ def build_dataset(output_dir: Path, dataset_id: str, version: str) -> None:
             checksums[file_path.name] = sha256_file(file_path)
     summary["checksums"] = checksums
     write_json(output_dir / "summary.json", summary)
+    return summary
+
+
+def print_summary(output_dir: Path, summary: dict[str, Any]) -> None:
+    print(f"Built pulse phase 1 dataset: {output_dir}")
+    print(f"  dataset_id: {summary['dataset_id']}")
+    print(f"  version: {summary['version']}")
+    print(f"  measurements: {summary['measurement_count']}")
+    print(f"  users: {summary['user_count']}")
+    print(f"  feature rows: {summary['feature_row_count']}")
+    print(f"  waveform assets: {summary['waveform_count']}")
+    print(f"  position features: {summary['position_feature_count']}")
+    print(f"  feature variables: {summary['feature_variable_count']}")
+    parquet_status = ", ".join(f"{key}={'yes' if value else 'no'}" for key, value in summary["parquet_written"].items())
+    print(f"  parquet: {parquet_status}")
+    print(f"  manifest: {output_dir / 'manifest.jsonl'}")
+    print(f"  summary: {output_dir / 'summary.json'}")
+    if summary["measurement_count"] == 0:
+        print("  warning: no pulse measurements were exported. Run parse-only first, or check pulse records in fact_modality_record.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -470,8 +489,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.output_root) / args.dataset_id / args.version
-    build_dataset(output_dir, args.dataset_id, args.version)
-    print(f"Built pulse phase 1 dataset: {output_dir}")
+    summary = build_dataset(output_dir, args.dataset_id, args.version)
+    print_summary(output_dir, summary)
 
 
 if __name__ == "__main__":
