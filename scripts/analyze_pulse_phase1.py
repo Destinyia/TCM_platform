@@ -85,8 +85,27 @@ def waveform_metrics(dataset_dir: Path) -> pd.DataFrame:
             except json.JSONDecodeError:
                 preview = []
         preview = preview or []
-        y_values = [safe_float(point.get("y")) for point in preview if isinstance(point, dict)]
+        if isinstance(preview, dict) and isinstance(preview.get("points"), list):
+            raw_values = preview["points"]
+        elif isinstance(preview, list):
+            raw_values = preview
+        else:
+            raw_values = []
+        y_values = []
+        for point in raw_values:
+            if isinstance(point, dict):
+                y_values.append(safe_float(point.get("y")))
+            else:
+                y_values.append(safe_float(point))
         y_values = [value for value in y_values if value is not None]
+        summary = row.get("summary_json")
+        if isinstance(summary, str):
+            try:
+                summary = json.loads(summary)
+            except json.JSONDecodeError:
+                summary = {}
+        summary = summary if isinstance(summary, dict) else {}
+
         if len(y_values) >= 2:
             drift_slope = (y_values[-1] - y_values[0]) / max(1, len(y_values) - 1)
             amplitude_range = max(y_values) - min(y_values)
@@ -104,10 +123,25 @@ def waveform_metrics(dataset_dir: Path) -> pd.DataFrame:
                 "baseline_instability": baseline_instability,
                 "artifact_ratio_from_preview": artifact_ratio,
                 "has_waveform_preview": bool(y_values),
+                "waveform_preview_point_count": len(y_values),
+                "waveform_sample_count": safe_float(row.get("sample_count")) or safe_float(summary.get("count")),
+                "waveform_sampling_rate": safe_float(row.get("sampling_rate")),
             }
         )
     if not result:
-        return pd.DataFrame(columns=["measurement_id", "waveform_channel_count", "baseline_drift_slope", "baseline_instability", "artifact_ratio_from_preview", "has_waveform_preview"])
+        return pd.DataFrame(
+            columns=[
+                "measurement_id",
+                "waveform_channel_count",
+                "baseline_drift_slope",
+                "baseline_instability",
+                "artifact_ratio_from_preview",
+                "has_waveform_preview",
+                "waveform_preview_point_count",
+                "waveform_sample_count",
+                "waveform_sampling_rate",
+            ]
+        )
     frame = pd.DataFrame(result)
     return frame.groupby("measurement_id", as_index=False).agg(
         {
@@ -116,6 +150,9 @@ def waveform_metrics(dataset_dir: Path) -> pd.DataFrame:
             "baseline_instability": "mean",
             "artifact_ratio_from_preview": "mean",
             "has_waveform_preview": "max",
+            "waveform_preview_point_count": "max",
+            "waveform_sample_count": "max",
+            "waveform_sampling_rate": "max",
         }
     )
 
@@ -127,6 +164,8 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
     frame["stability_score"] = pd.to_numeric(frame["stability_score"], errors="coerce")
     frame["amplitude"] = pd.to_numeric(frame["amplitude"], errors="coerce")
     frame["duration_seconds"] = pd.to_numeric(frame["duration_seconds"], errors="coerce").fillna(0)
+    frame["waveform_sample_count"] = pd.to_numeric(frame.get("waveform_sample_count"), errors="coerce")
+    frame["waveform_sampling_rate"] = pd.to_numeric(frame.get("waveform_sampling_rate"), errors="coerce")
     frame["baseline_instability"] = pd.to_numeric(frame["baseline_instability"], errors="coerce").fillna(1.0)
     frame["artifact_ratio_from_preview"] = pd.to_numeric(frame["artifact_ratio_from_preview"], errors="coerce").fillna(1.0)
     frame["has_waveform_preview"] = frame["has_waveform_preview"].fillna(False)
@@ -139,20 +178,34 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
     signal_quality = (stability_component - drift_penalty - artifact_penalty + waveform_bonus).map(lambda value: clamp(float(value)))
     drift_index = (frame["baseline_instability"].clip(0, 1) * 70 + (100 - stability_component) * 0.3).map(lambda value: clamp(float(value)))
     stable_segment_ratio = (stability_component / 100 - frame["baseline_instability"].clip(0, 1) * 0.25).clip(0, 1)
-    best_duration = (frame["duration_seconds"] * stable_segment_ratio).clip(lower=0)
+    inferred_duration = frame["duration_seconds"].where(frame["duration_seconds"] > 0)
+    waveform_duration = frame["waveform_sample_count"] / frame["waveform_sampling_rate"]
+    waveform_duration = waveform_duration.where((frame["waveform_sample_count"] > 0) & (frame["waveform_sampling_rate"] > 0))
+    inferred_duration = inferred_duration.fillna(waveform_duration)
+    has_duration = inferred_duration.notna() & (inferred_duration > 0)
+    best_duration = (inferred_duration.fillna(0) * stable_segment_ratio).clip(lower=0)
 
     labels = []
     reasons = []
-    for quality, duration, ratio in zip(signal_quality, best_duration, stable_segment_ratio):
-        if quality >= 75 and duration >= 20 and ratio >= 0.5:
+    for quality, duration, ratio, duration_available in zip(signal_quality, best_duration, stable_segment_ratio, has_duration):
+        if duration_available and quality >= 75 and duration >= 20 and ratio >= 0.5:
             labels.append("valid")
             reasons.append("")
-        elif quality >= 60 and duration >= 10:
+        elif duration_available and quality >= 60 and duration >= 10:
             labels.append("partial_valid")
             reasons.append("stable segment is short or quality is moderate")
+        elif not duration_available and quality >= 75 and ratio >= 0.5:
+            labels.append("partial_valid")
+            reasons.append("duration unavailable; waveform preview supports quality-only screening")
+        elif not duration_available and quality >= 60:
+            labels.append("partial_valid")
+            reasons.append("duration unavailable; moderate quality-only screening")
         else:
             labels.append("invalid")
             reasons.append("insufficient stable high-quality segment")
+
+    best_start = ((inferred_duration - best_duration) / 2).where(has_duration).clip(lower=0)
+    best_end = (best_start + best_duration).where(has_duration)
 
     result = pd.DataFrame(
         {
@@ -166,9 +219,11 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
             "baseline_drift_slope": frame["baseline_drift_slope"].fillna(0).round(6),
             "artifact_ratio": frame["artifact_ratio_from_preview"].round(3),
             "stable_segment_ratio": stable_segment_ratio.round(3),
-            "best_segment_start_time": ((frame["duration_seconds"] - best_duration) / 2).clip(lower=0).round(3),
-            "best_segment_end_time": (((frame["duration_seconds"] - best_duration) / 2) + best_duration).clip(lower=0).round(3),
-            "best_segment_duration": best_duration.round(3),
+            "inferred_duration_seconds": inferred_duration.round(3),
+            "duration_available": has_duration,
+            "best_segment_start_time": best_start.round(3),
+            "best_segment_end_time": best_end.round(3),
+            "best_segment_duration": best_duration.where(has_duration).round(3),
             "best_segment_quality_score": signal_quality.round(3),
             "measurement_validity_label": labels,
             "invalid_segment_reason": reasons,
@@ -330,6 +385,7 @@ def write_outputs(output_dir: Path, frames: dict[str, pd.DataFrame], summary: di
 def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> str:
     quality = frames.get("measurement_quality", pd.DataFrame())
     reliability = frames.get("feature_reliability", pd.DataFrame())
+    device = frames.get("device_consistency", pd.DataFrame())
     lines = [
         "# Pulse Phase 1 Analysis Report",
         "",
@@ -342,6 +398,7 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         f"- valid measurements: {summary['valid_measurement_count']}",
         f"- partial valid measurements: {summary['partial_valid_measurement_count']}",
         f"- invalid measurements: {summary['invalid_measurement_count']}",
+        f"- duration unavailable measurements: {summary['duration_unavailable_measurement_count']}",
         "",
         "## Feature Reliability",
         "",
@@ -359,6 +416,14 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         avg_drift = quality["drift_severity_index"].mean()
         lines.append(f"- average signal quality score: {avg_quality:.2f}")
         lines.append(f"- average drift severity index: {avg_drift:.2f}")
+        if summary["duration_unavailable_measurement_count"]:
+            lines.append("- duration is unavailable for some measurements; these rows cannot be promoted from `partial_valid` to `valid`.")
+    lines.extend(["", "## Device Consistency", ""])
+    if device.empty:
+        lines.append(f"No cross-device feature pairs were produced within {summary['near_time_pair_window_minutes']} minutes.")
+    else:
+        lines.append(f"- feature rows: {summary['device_consistency_feature_count']}")
+        lines.append(f"- paired comparisons: {summary['device_consistency_pair_count']}")
     return "\n".join(lines) + "\n"
 
 
@@ -376,8 +441,10 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         "valid_measurement_count": int((quality["measurement_validity_label"] == "valid").sum()) if not quality.empty else 0,
         "partial_valid_measurement_count": int((quality["measurement_validity_label"] == "partial_valid").sum()) if not quality.empty else 0,
         "invalid_measurement_count": int((quality["measurement_validity_label"] == "invalid").sum()) if not quality.empty else 0,
+        "duration_unavailable_measurement_count": int((quality["duration_available"] == False).sum()) if not quality.empty and "duration_available" in quality else 0,
         "feature_count": int(len(reliability)),
         "device_consistency_feature_count": int(len(device)),
+        "device_consistency_pair_count": int(device["pair_count"].sum()) if not device.empty and "pair_count" in device else 0,
         "near_time_pair_window_minutes": near_minutes,
     }
     write_outputs(
