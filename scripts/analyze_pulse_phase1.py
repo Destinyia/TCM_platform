@@ -119,15 +119,31 @@ def mean_std(values: list[float]) -> tuple[float | None, float | None]:
     return mean, math.sqrt(max(0.0, variance))
 
 
+def variance(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    return sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+
+
+def linear_regression(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return 0.0, ys[0] if ys else 0.0
+    x_mean = sum(xs) / len(xs)
+    y_mean = sum(ys) / len(ys)
+    denominator = sum((x - x_mean) ** 2 for x in xs)
+    if denominator == 0:
+        return 0.0, y_mean
+    slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denominator
+    intercept = y_mean - slope * x_mean
+    return slope, intercept
+
+
 def linear_detrend(values: list[float]) -> list[float]:
     if len(values) < 2:
         return values[:]
     n = len(values)
-    x_mean = (n - 1) / 2
-    y_mean = sum(values) / n
-    denominator = sum((index - x_mean) ** 2 for index in range(n))
-    slope = sum((index - x_mean) * (value - y_mean) for index, value in enumerate(values)) / denominator if denominator else 0.0
-    intercept = y_mean - slope * x_mean
+    slope, intercept = linear_regression([float(index) for index in range(n)], values)
     return [value - (intercept + slope * index) for index, value in enumerate(values)]
 
 
@@ -154,40 +170,209 @@ def autocorrelation_peak(values: list[float]) -> tuple[float, int | None]:
     return best_corr, best_lag
 
 
-def preview_channel_metrics(values: list[float]) -> dict[str, Any]:
+def autocorrelation_peak_for_lag_range(values: list[float], min_lag: int, max_lag: int) -> tuple[float, int | None]:
+    if len(values) < 16:
+        return 0.0, None
+    mean = sum(values) / len(values)
+    centered = [value - mean for value in values]
+    denominator = sum(value * value for value in centered)
+    if denominator <= 0:
+        return 0.0, None
+
+    min_lag = max(2, min_lag)
+    max_lag = min(max_lag, max(2, len(values) // 2))
+    if max_lag < min_lag:
+        return 0.0, None
+
+    best_corr = 0.0
+    best_lag = None
+    for lag in range(min_lag, max_lag + 1):
+        numerator = sum(centered[index] * centered[index - lag] for index in range(lag, len(centered)))
+        corr = numerator / denominator
+        if corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+    return best_corr, best_lag
+
+
+def preview_seconds_per_point(duration_seconds: float | None, point_count: int) -> float | None:
+    if duration_seconds is None or duration_seconds <= 0 or point_count < 2:
+        return None
+    return duration_seconds / (point_count - 1)
+
+
+def pulse_lag_range(point_count: int, duration_seconds: float | None) -> tuple[int, int]:
+    seconds_per_point = preview_seconds_per_point(duration_seconds, point_count)
+    if seconds_per_point:
+        min_lag = math.floor((60 / 180) / seconds_per_point)
+        max_lag = math.ceil((60 / 40) / seconds_per_point)
+        return max(2, min_lag), min(max(2, point_count // 2), max_lag)
+    return 3, min(28, max(3, point_count // 2))
+
+
+def detect_preview_peaks(values: list[float]) -> list[int]:
+    if len(values) < 5:
+        return []
+    detrended = linear_detrend(values)
+    mean, std = mean_std(detrended)
+    threshold = (mean or 0.0) + (std or 0.0) * 0.25
+    peaks = []
+    for index in range(1, len(detrended) - 1):
+        if detrended[index] >= detrended[index - 1] and detrended[index] > detrended[index + 1] and detrended[index] >= threshold:
+            peaks.append(index)
+    return peaks
+
+
+def period_consistency_from_peaks(peaks: list[int]) -> float | None:
+    if len(peaks) < 3:
+        return None
+    intervals = [peaks[index] - peaks[index - 1] for index in range(1, len(peaks))]
+    interval_mean, interval_std = mean_std([float(value) for value in intervals])
+    if not interval_mean:
+        return None
+    return clamp(1 - ((interval_std or 0.0) / interval_mean), 0, 1)
+
+
+def build_periodic_template(values: list[float], lag: int | None) -> tuple[list[float], list[float], list[float]]:
+    if not lag or lag < 2 or len(values) < lag * 2:
+        return [], [], values[:]
+
+    phase_values: list[list[float]] = [[] for _ in range(lag)]
+    for index, value in enumerate(values):
+        phase_values[index % lag].append(value)
+    template = []
+    for bucket in phase_values:
+        template.append(sum(bucket) / len(bucket) if bucket else 0.0)
+    repeated = [template[index % lag] for index in range(len(values))]
+    residual = [value - predicted for value, predicted in zip(values, repeated)]
+    return template, repeated, residual
+
+
+def normalize_vector(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    mean, std = mean_std(values)
+    if not std:
+        return [0.0 for _ in values]
+    return [(value - (mean or 0.0)) / std for value in values]
+
+
+def round_vector(values: list[float], places: int = 6) -> list[float]:
+    return [round(float(value), places) for value in values]
+
+
+def dfa_alpha(values: list[float]) -> tuple[float | None, float | None]:
+    if len(values) < 16:
+        return None, None
+    mean = sum(values) / len(values)
+    integrated = []
+    total = 0.0
+    for value in values:
+        total += value - mean
+        integrated.append(total)
+
+    scales = [4, 8, 16, 32]
+    fluctuations = []
+    for scale in scales:
+        if scale * 2 > len(integrated):
+            continue
+        segment_fluctuations = []
+        for start in range(0, len(integrated) - scale + 1, scale):
+            segment = integrated[start : start + scale]
+            xs = [float(index) for index in range(scale)]
+            slope, intercept = linear_regression(xs, segment)
+            residuals = [value - (intercept + slope * index) for index, value in enumerate(segment)]
+            rms = math.sqrt(sum(value * value for value in residuals) / len(residuals))
+            if rms > 0:
+                segment_fluctuations.append(rms)
+        if segment_fluctuations:
+            fluctuations.append((scale, sum(segment_fluctuations) / len(segment_fluctuations)))
+    if len(fluctuations) < 2:
+        return None, None
+
+    log_scales = [math.log(scale) for scale, _ in fluctuations]
+    log_fluctuations = [math.log(fluctuation) for _, fluctuation in fluctuations if fluctuation > 0]
+    if len(log_scales) != len(log_fluctuations) or len(log_fluctuations) < 2:
+        return None, None
+    slope, _ = linear_regression(log_scales, log_fluctuations)
+    return slope, slope
+
+
+def decompose_preview_signal(values: list[float], duration_seconds: float | None = None) -> dict[str, Any]:
     if len(values) < 16:
         return {
             "preview_point_count": len(values),
-            "pulse_energy": None,
-            "residual_fluctuation": None,
-            "template_coherence": None,
-            "periodic_snr": None,
             "dominant_lag_preview_points": None,
+            "template_vector": [],
+            "normalized_template_vector": [],
+            "residual_vector": [],
         }
 
-    detrended = linear_detrend(values)
+    trend_slope, trend_intercept = linear_regression([float(index) for index in range(len(values))], values)
+    detrended = [value - (trend_intercept + trend_slope * index) for index, value in enumerate(values)]
+    min_lag, max_lag = pulse_lag_range(len(values), duration_seconds)
+    template_coherence, dominant_lag = autocorrelation_peak_for_lag_range(detrended, min_lag, max_lag)
+    if dominant_lag is None:
+        template_coherence, dominant_lag = autocorrelation_peak(detrended)
+
+    template, repeated, residual = build_periodic_template(detrended, dominant_lag)
+    detrended_variance = variance(detrended) or 0.0
+    residual_variance = variance(residual) or 0.0
+    template_variance = variance(repeated) or 0.0
+    explained_ratio = clamp(1 - (residual_variance / detrended_variance), 0, 1) if detrended_variance else 0.0
+    periodic_snr = template_variance / (residual_variance + 1e-9)
+    pulse_energy = template_variance
+    residual_energy_ratio = residual_variance / (detrended_variance + 1e-9) if detrended_variance else 1.0
+    residual_mean, residual_std = mean_std(residual)
+    detrended_mean, detrended_std = mean_std(detrended)
     p05 = percentile(values, 0.05) or min(values)
     p95 = percentile(values, 0.95) or max(values)
     amplitude_range = max(0.0, p95 - p05)
-    _, residual_std = mean_std(detrended)
-    diffs = [detrended[index] - detrended[index - 1] for index in range(1, len(detrended))]
-    _, diff_std = mean_std(diffs)
-    template_coherence, dominant_lag = autocorrelation_peak(detrended)
+    residual_fluctuation = (residual_std or 0.0) / (amplitude_range + 1e-9) if amplitude_range else 1.0
 
-    residual_std = residual_std or 0.0
-    diff_std = diff_std or 0.0
-    pulse_energy = residual_std * residual_std
-    residual_fluctuation = diff_std / (amplitude_range + 1e-9) if amplitude_range else 1.0
-    periodic_snr = max(0.0, template_coherence) * residual_std / (diff_std + 1e-9)
+    peaks = detect_preview_peaks(values)
+    peak_consistency = period_consistency_from_peaks(peaks)
+    if peak_consistency is None:
+        peak_consistency = template_coherence
+
+    seconds_per_point = preview_seconds_per_point(duration_seconds, len(values))
+    estimated_period_seconds = dominant_lag * seconds_per_point if dominant_lag and seconds_per_point else None
+    estimated_pulse_rate_bpm = 60 / estimated_period_seconds if estimated_period_seconds and estimated_period_seconds > 0 else None
+    pulse_count_estimate = duration_seconds / estimated_period_seconds if duration_seconds and estimated_period_seconds else None
+    dfa, multiscale_slope = dfa_alpha(residual)
 
     return {
         "preview_point_count": len(values),
         "pulse_energy": pulse_energy,
         "residual_fluctuation": residual_fluctuation,
+        "residual_std": residual_std,
+        "residual_cv": (residual_std or 0.0) / detrended_std if detrended_std else None,
+        "residual_energy_ratio": residual_energy_ratio,
         "template_coherence": template_coherence,
         "periodic_snr": periodic_snr,
         "dominant_lag_preview_points": dominant_lag,
+        "period_lag_min_preview_points": min_lag,
+        "period_lag_max_preview_points": max_lag,
+        "estimated_period_seconds": estimated_period_seconds,
+        "estimated_pulse_rate_bpm": estimated_pulse_rate_bpm,
+        "pulse_count_estimate": pulse_count_estimate,
+        "peak_count_preview": len(peaks),
+        "period_consistency_score": peak_consistency,
+        "trend_slope_preview": trend_slope,
+        "trend_intercept_preview": trend_intercept,
+        "template_explained_variance_ratio": explained_ratio,
+        "detrended_std": detrended_std,
+        "dfa_alpha": dfa,
+        "multi_scale_fluctuation_slope": multiscale_slope,
+        "template_vector": template,
+        "normalized_template_vector": normalize_vector(template),
+        "residual_vector": residual,
     }
+
+
+def preview_channel_metrics(values: list[float]) -> dict[str, Any]:
+    metrics = decompose_preview_signal(values)
+    return {key: value for key, value in metrics.items() if key not in {"template_vector", "normalized_template_vector", "residual_vector"}}
 
 
 def load_feature_matrix(dataset_dir: Path) -> pd.DataFrame:
@@ -291,12 +476,13 @@ def analyze_channel_signal_quality(dataset_dir: Path, feature_matrix: pd.DataFra
         summary = parse_json_value(row.get("summary_json"), {})
         summary = summary if isinstance(summary, dict) else {}
         values = extract_preview_values(row)
-        metrics = preview_channel_metrics(values)
         sample_count = safe_float(row.get("sample_count")) or safe_float(summary.get("count"))
         sampling_rate = safe_float(row.get("sampling_rate")) or safe_float(summary.get("sampling_rate"))
         duration_seconds = safe_float(row.get("duration_seconds")) or safe_float(summary.get("duration_seconds"))
         if duration_seconds is None and sample_count and sampling_rate:
             duration_seconds = sample_count / sampling_rate
+        metrics = decompose_preview_signal(values, duration_seconds)
+        metrics = {key: value for key, value in metrics.items() if key not in {"template_vector", "normalized_template_vector", "residual_vector"}}
 
         records.append(
             {
@@ -370,6 +556,19 @@ def analyze_channel_signal_quality(dataset_dir: Path, feature_matrix: pd.DataFra
         "sample_count",
         "sampling_rate",
         "duration_seconds",
+        "estimated_period_seconds",
+        "estimated_pulse_rate_bpm",
+        "pulse_count_estimate",
+        "period_consistency_score",
+        "trend_slope_preview",
+        "trend_intercept_preview",
+        "template_explained_variance_ratio",
+        "residual_std",
+        "residual_cv",
+        "residual_energy_ratio",
+        "detrended_std",
+        "dfa_alpha",
+        "multi_scale_fluctuation_slope",
     ]
     for column in numeric_columns:
         if column in frame:
@@ -456,6 +655,191 @@ def summarize_longitudinal_channels(channel_quality: pd.DataFrame) -> pd.DataFra
             }
         )
     return pd.DataFrame(rows)
+
+
+def analyze_pulse_periodicity(channel_quality: pd.DataFrame) -> pd.DataFrame:
+    if channel_quality.empty:
+        return pd.DataFrame()
+
+    columns = [
+        "measurement_id",
+        "waveform_asset_id",
+        "user_id",
+        "source_vendor",
+        "device_id",
+        "visit_slot",
+        "start_time",
+        "channel_name",
+        "standard_channel_name",
+        "duration_seconds",
+        "preview_point_count",
+        "dominant_lag_preview_points",
+        "period_lag_min_preview_points",
+        "period_lag_max_preview_points",
+        "estimated_period_seconds",
+        "estimated_pulse_rate_bpm",
+        "pulse_count_estimate",
+        "peak_count_preview",
+        "period_consistency_score",
+        "periodic_snr",
+        "pulse_energy",
+        "template_coherence",
+        "template_explained_variance_ratio",
+        "channel_energy_ratio_to_median",
+        "alignment_suspicion_score",
+        "channel_validity_label",
+    ]
+    frame = channel_quality[[column for column in columns if column in channel_quality.columns]].copy()
+    frame["periodic_snr"] = pd.to_numeric(frame["periodic_snr"], errors="coerce")
+    frame["template_coherence"] = pd.to_numeric(frame["template_coherence"], errors="coerce")
+    frame["period_consistency_score"] = pd.to_numeric(frame["period_consistency_score"], errors="coerce")
+    frame["alignment_suspicion_score"] = pd.to_numeric(frame["alignment_suspicion_score"], errors="coerce")
+    frame["estimated_pulse_rate_bpm"] = pd.to_numeric(frame["estimated_pulse_rate_bpm"], errors="coerce")
+
+    labels = []
+    for _, row in frame.iterrows():
+        snr = safe_float(row.get("periodic_snr")) or 0.0
+        coherence = safe_float(row.get("template_coherence")) or 0.0
+        consistency = safe_float(row.get("period_consistency_score")) or 0.0
+        suspicion = safe_float(row.get("alignment_suspicion_score")) or 0.0
+        bpm = safe_float(row.get("estimated_pulse_rate_bpm"))
+        plausible_bpm = bpm is None or 35 <= bpm <= 180
+        if suspicion >= 60:
+            label = "suspected_misalignment"
+        elif snr >= 0.35 and coherence >= 0.25 and consistency >= 0.25 and plausible_bpm:
+            label = "clear_periodic"
+        elif snr >= 0.08 and coherence >= 0.08 and plausible_bpm:
+            label = "weak_periodic"
+        else:
+            label = "non_periodic_or_noise"
+        labels.append(label)
+    frame["periodic_signal_label"] = labels
+    frame["channel_periodicity_rank"] = (
+        frame.groupby("measurement_id")["periodic_snr"].rank(method="first", ascending=False, na_option="bottom").astype("Int64")
+    )
+    return frame
+
+
+def waveform_metadata(feature_matrix: pd.DataFrame) -> pd.DataFrame:
+    metadata_columns = [
+        "measurement_id",
+        "user_id",
+        "source_vendor",
+        "device_id",
+        "visit_slot",
+        "start_time",
+        "duration_seconds",
+    ]
+    if feature_matrix.empty:
+        return pd.DataFrame()
+    available_columns = [column for column in metadata_columns if column in feature_matrix.columns]
+    if "measurement_id" not in available_columns:
+        return pd.DataFrame()
+    return feature_matrix[available_columns].drop_duplicates("measurement_id")
+
+
+def analyze_template_decomposition(dataset_dir: Path, feature_matrix: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = read_jsonl(dataset_dir / "waveform_manifest.jsonl")
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    metadata = waveform_metadata(feature_matrix)
+    measurement_meta = metadata.set_index("measurement_id").to_dict(orient="index") if not metadata.empty else {}
+    decomposition_rows = []
+    template_rows = []
+    for row in rows:
+        summary = parse_json_value(row.get("summary_json"), {})
+        summary = summary if isinstance(summary, dict) else {}
+        values = extract_preview_values(row)
+        sample_count = safe_float(row.get("sample_count")) or safe_float(summary.get("count"))
+        sampling_rate = safe_float(row.get("sampling_rate")) or safe_float(summary.get("sampling_rate"))
+        duration_seconds = safe_float(row.get("duration_seconds")) or safe_float(summary.get("duration_seconds"))
+        if duration_seconds is None and sample_count and sampling_rate:
+            duration_seconds = sample_count / sampling_rate
+        meta = measurement_meta.get(row.get("measurement_id"), {})
+        if duration_seconds is None:
+            duration_seconds = safe_float(meta.get("duration_seconds"))
+
+        metrics = decompose_preview_signal(values, duration_seconds)
+        channel = standard_channel_name(row.get("channel_name"))
+        template_quality_score = clamp(
+            (safe_float(metrics.get("template_explained_variance_ratio")) or 0.0) * 45
+            + (safe_float(metrics.get("template_coherence")) or 0.0) * 35
+            + min(1.0, safe_float(metrics.get("periodic_snr")) or 0.0) * 20
+            - (safe_float(metrics.get("residual_energy_ratio")) or 1.0) * 15
+        )
+
+        decomposition_rows.append(
+            {
+                "measurement_id": row.get("measurement_id"),
+                "waveform_asset_id": row.get("waveform_asset_id"),
+                "user_id": meta.get("user_id"),
+                "source_vendor": meta.get("source_vendor"),
+                "device_id": meta.get("device_id"),
+                "visit_slot": meta.get("visit_slot"),
+                "start_time": meta.get("start_time"),
+                "channel_name": row.get("channel_name"),
+                "standard_channel_name": channel,
+                "duration_seconds": duration_seconds,
+                "sample_count": sample_count,
+                "sampling_rate": sampling_rate,
+                "preview_point_count": metrics.get("preview_point_count"),
+                "trend_slope_preview": metrics.get("trend_slope_preview"),
+                "trend_intercept_preview": metrics.get("trend_intercept_preview"),
+                "dominant_lag_preview_points": metrics.get("dominant_lag_preview_points"),
+                "estimated_period_seconds": metrics.get("estimated_period_seconds"),
+                "estimated_pulse_rate_bpm": metrics.get("estimated_pulse_rate_bpm"),
+                "template_explained_variance_ratio": metrics.get("template_explained_variance_ratio"),
+                "periodic_snr": metrics.get("periodic_snr"),
+                "pulse_energy": metrics.get("pulse_energy"),
+                "template_coherence": metrics.get("template_coherence"),
+                "residual_std": metrics.get("residual_std"),
+                "residual_cv": metrics.get("residual_cv"),
+                "residual_energy_ratio": metrics.get("residual_energy_ratio"),
+                "residual_fluctuation": metrics.get("residual_fluctuation"),
+                "dfa_alpha": metrics.get("dfa_alpha"),
+                "multi_scale_fluctuation_slope": metrics.get("multi_scale_fluctuation_slope"),
+                "template_quality_score": template_quality_score,
+                "decomposition_quality_label": "usable_template" if template_quality_score >= 45 else "weak_template" if template_quality_score >= 20 else "insufficient_periodic_structure",
+            }
+        )
+
+        for template_type, vector in [
+            ("amplitude_preserved_template", metrics.get("template_vector") or []),
+            ("amplitude_normalized_template", metrics.get("normalized_template_vector") or []),
+        ]:
+            template_rows.append(
+                {
+                    "template_id": f"{row.get('waveform_asset_id') or row.get('measurement_id')}:{template_type}",
+                    "measurement_id": row.get("measurement_id"),
+                    "waveform_asset_id": row.get("waveform_asset_id"),
+                    "user_id": meta.get("user_id"),
+                    "channel_name": row.get("channel_name"),
+                    "standard_channel_name": channel,
+                    "template_type": template_type,
+                    "template_point_count": len(vector),
+                    "template_vector_json": json.dumps(round_vector(vector), ensure_ascii=False),
+                    "template_quality_score": round(template_quality_score, 3),
+                    "pulse_energy": metrics.get("pulse_energy"),
+                    "template_coherence": metrics.get("template_coherence"),
+                    "periodic_snr": metrics.get("periodic_snr"),
+                    "source_segment_start": 0.0 if duration_seconds else None,
+                    "source_segment_end": duration_seconds,
+                }
+            )
+
+    decomposition = pd.DataFrame(decomposition_rows)
+    templates = pd.DataFrame(template_rows)
+    for frame in [decomposition, templates]:
+        for column in frame.columns:
+            if column.endswith("_json") or column in {"template_id", "measurement_id", "waveform_asset_id", "user_id", "source_vendor", "device_id", "visit_slot", "start_time", "channel_name", "standard_channel_name", "template_type", "decomposition_quality_label"}:
+                continue
+            converted = pd.to_numeric(frame[column], errors="coerce")
+            if converted.notna().any() or frame[column].isna().all():
+                frame[column] = converted
+        numeric_columns = frame.select_dtypes(include=["number"]).columns
+        frame[numeric_columns] = frame[numeric_columns].round(6)
+    return decomposition, templates
 
 
 def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd.DataFrame, channel_summary: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -737,12 +1121,15 @@ def write_outputs(output_dir: Path, frames: dict[str, pd.DataFrame], summary: di
 def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> str:
     quality = frames.get("measurement_quality", pd.DataFrame())
     channel_quality = frames.get("channel_signal_quality", pd.DataFrame())
+    pulse_periodicity = frames.get("pulse_periodicity", pd.DataFrame())
+    decomposition = frames.get("trend_residual_decomposition", pd.DataFrame())
+    templates = frames.get("pulse_templates", pd.DataFrame())
     measurement_channels = frames.get("measurement_channel_summary", pd.DataFrame())
     longitudinal_channels = frames.get("longitudinal_channel_summary", pd.DataFrame())
     reliability = frames.get("feature_reliability", pd.DataFrame())
     device = frames.get("device_consistency", pd.DataFrame())
     lines = [
-        "# Pulse Phase 1 Analysis Report",
+        "# Pulse Phase 1-3 Analysis Report",
         "",
         f"Generated at: {summary['created_at']}",
         "",
@@ -757,6 +1144,9 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         f"- waveform channel rows: {summary['channel_signal_count']}",
         f"- valid channel rows: {summary['valid_channel_signal_count']}",
         f"- suspected misalignment channel rows: {summary['suspected_misalignment_channel_count']}",
+        f"- periodicity rows: {summary['pulse_periodicity_count']}",
+        f"- decomposition rows: {summary['trend_residual_decomposition_count']}",
+        f"- pulse template rows: {summary['pulse_template_count']}",
         "",
         "## Feature Reliability",
         "",
@@ -796,6 +1186,33 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
             lines.append(f"- average channel_balance_index: {avg_balance:.4f}")
     if not longitudinal_channels.empty:
         lines.append(f"- longitudinal user-channel summaries: {len(longitudinal_channels)}")
+    lines.extend(["", "## Pulse Periodicity", ""])
+    if pulse_periodicity.empty:
+        lines.append("No pulse periodicity rows were produced.")
+    else:
+        label_counts = pulse_periodicity["periodic_signal_label"].value_counts().to_dict()
+        for label in ["clear_periodic", "weak_periodic", "non_periodic_or_noise", "suspected_misalignment"]:
+            if label in label_counts:
+                lines.append(f"- {label}: {label_counts[label]}")
+        avg_bpm = pulse_periodicity["estimated_pulse_rate_bpm"].mean()
+        if not math.isnan(avg_bpm):
+            lines.append(f"- average estimated pulse rate: {avg_bpm:.2f} bpm")
+    lines.extend(["", "## Trend And Template Decomposition", ""])
+    if decomposition.empty:
+        lines.append("No trend/template decomposition rows were produced.")
+    else:
+        label_counts = decomposition["decomposition_quality_label"].value_counts().to_dict()
+        for label in ["usable_template", "weak_template", "insufficient_periodic_structure"]:
+            if label in label_counts:
+                lines.append(f"- {label}: {label_counts[label]}")
+        avg_dfa = decomposition["dfa_alpha"].mean()
+        avg_residual = decomposition["residual_energy_ratio"].mean()
+        if not math.isnan(avg_dfa):
+            lines.append(f"- average DFA alpha: {avg_dfa:.4f}")
+        if not math.isnan(avg_residual):
+            lines.append(f"- average residual energy ratio: {avg_residual:.4f}")
+    if not templates.empty:
+        lines.append(f"- pulse templates: {len(templates)}")
     lines.extend(["", "## Device Consistency", ""])
     if device.empty:
         lines.append(f"No cross-device feature pairs were produced within {summary['near_time_pair_window_minutes']} minutes.")
@@ -809,6 +1226,8 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
     feature_matrix = load_feature_matrix(dataset_dir)
     waveform_frame = waveform_metrics(dataset_dir)
     channel_quality = analyze_channel_signal_quality(dataset_dir, feature_matrix)
+    pulse_periodicity = analyze_pulse_periodicity(channel_quality)
+    decomposition, templates = analyze_template_decomposition(dataset_dir, feature_matrix)
     measurement_channels = summarize_measurement_channels(channel_quality)
     longitudinal_channels = summarize_longitudinal_channels(channel_quality)
     quality = analyze_measurement_quality(feature_matrix, waveform_frame, measurement_channels)
@@ -828,6 +1247,12 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         "low_snr_channel_count": int((channel_quality["channel_validity_label"] == "low_snr").sum()) if not channel_quality.empty else 0,
         "suspected_misalignment_channel_count": int((channel_quality["channel_validity_label"] == "suspected_misalignment").sum()) if not channel_quality.empty else 0,
         "insufficient_preview_channel_count": int((channel_quality["channel_validity_label"] == "insufficient_preview").sum()) if not channel_quality.empty else 0,
+        "pulse_periodicity_count": int(len(pulse_periodicity)),
+        "clear_periodic_channel_count": int((pulse_periodicity["periodic_signal_label"] == "clear_periodic").sum()) if not pulse_periodicity.empty else 0,
+        "weak_periodic_channel_count": int((pulse_periodicity["periodic_signal_label"] == "weak_periodic").sum()) if not pulse_periodicity.empty else 0,
+        "trend_residual_decomposition_count": int(len(decomposition)),
+        "usable_template_decomposition_count": int((decomposition["decomposition_quality_label"] == "usable_template").sum()) if not decomposition.empty else 0,
+        "pulse_template_count": int(len(templates)),
         "measurement_channel_summary_count": int(len(measurement_channels)),
         "longitudinal_channel_summary_count": int(len(longitudinal_channels)),
         "feature_count": int(len(reliability)),
@@ -840,6 +1265,9 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         {
             "measurement_quality": quality,
             "channel_signal_quality": channel_quality,
+            "pulse_periodicity": pulse_periodicity,
+            "trend_residual_decomposition": decomposition,
+            "pulse_templates": templates,
             "measurement_channel_summary": measurement_channels,
             "longitudinal_channel_summary": longitudinal_channels,
             "feature_reliability": reliability,
