@@ -68,30 +68,25 @@
                 </div>
               </div>
 
-              <div v-if="patientVisualizationLoading || patientVisualization?.available" class="patient-visualization-panel">
+              <div v-if="patientSummaryLoading || patientPulseSummary?.available" class="patient-visualization-panel">
                 <div class="visualization-header">
                   <div>
-                    <strong>单用户脉诊可视化</strong>
-                    <span v-if="patientVisualization?.selected_measurement_start_time">
-                      示例记录 {{ patientVisualization.selected_measurement_start_time }}
+                    <strong>单用户脉诊在线分析</strong>
+                    <span v-if="patientPulseSummary?.selected_measurement_start_time">
+                      示例记录 {{ patientPulseSummary.selected_measurement_start_time }}
                     </span>
                   </div>
-                  <el-tag v-if="patientVisualization?.patient_periodic_rows !== undefined" size="small" type="success">
-                    周期通道 {{ patientVisualization.patient_periodic_rows }}
+                  <el-tag v-if="patientPulseSummary?.patient_periodic_rows !== undefined" size="small" type="success">
+                    周期通道 {{ patientPulseSummary.patient_periodic_rows }}
                   </el-tag>
                 </div>
-                <el-skeleton v-if="patientVisualizationLoading" animated :rows="5" />
+                <el-skeleton v-if="patientSummaryLoading" animated :rows="5" />
                 <template v-else>
-                  <img
-                    v-if="patientVisualizationImageUrl"
-                    :src="patientVisualizationImageUrl"
-                    alt="单用户脉诊可视化"
-                    class="patient-visualization-image"
-                  />
+                  <div ref="patientOnlineAnalysisChartRef" class="patient-online-analysis-chart"></div>
                   <div class="visualization-meta">
-                    <span>{{ patientVisualization.patient_measurements }} 条记录</span>
-                    <span>{{ patientVisualization.patient_channel_rows }} 条通道样本</span>
-                    <span>平均 SNR {{ formatNumber(patientVisualization.patient_avg_periodic_snr, 3) }}</span>
+                    <span>{{ patientPulseSummary.patient_measurements }} 条记录</span>
+                    <span>{{ patientPulseSummary.patient_channel_rows }} 条通道样本</span>
+                    <span>平均 SNR {{ formatNumber(patientPulseSummary.patient_avg_periodic_snr, 3) }}</span>
                   </div>
                 </template>
               </div>
@@ -244,15 +239,15 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
-import { api, apiUrl } from '../services/api'
+import { api } from '../services/api'
 
 const router = useRouter()
 const viewMode = ref('patients')
 const loading = ref(false)
 const users = ref([])
 const pulseRecords = ref([])
-const patientVisualization = ref(null)
-const patientVisualizationLoading = ref(false)
+const patientPulseSummary = ref(null)
+const patientSummaryLoading = ref(false)
 const selectedUserId = ref('')
 const selectedRecord = ref(null)
 const patientKeyword = ref('')
@@ -264,11 +259,13 @@ const recordPageSize = 12
 
 const patientTrendChartRef = ref(null)
 const patientSlotChartRef = ref(null)
+const patientOnlineAnalysisChartRef = ref(null)
 const waveformChartRef = ref(null)
 const recordFeatureChartRef = ref(null)
 const signalQualityChartRef = ref(null)
 let patientTrendChart
 let patientSlotChart
+let patientOnlineAnalysisChart
 let waveformChart
 let recordFeatureChart
 let signalQualityChart
@@ -328,11 +325,6 @@ const pagedPatients = computed(() => {
 })
 
 const selectedPatient = computed(() => patientSummaries.value.find((patient) => patient.user_id === selectedUserId.value))
-
-const patientVisualizationImageUrl = computed(() => {
-  if (!patientVisualization.value?.available || !patientVisualization.value?.image_url) return ''
-  return apiUrl(patientVisualization.value.image_url)
-})
 
 const selectedPatientRecords = computed(() => {
   return normalizedRecords.value
@@ -405,6 +397,11 @@ function formatNumber(value, digits = 1) {
   return Number.isFinite(number) ? number.toFixed(digits) : '-'
 }
 
+function formatDateTimeLabel(value) {
+  if (!value) return '-'
+  return String(value).replace('T', ' ').slice(0, 16)
+}
+
 function sourceName(value) {
   return { zhongke: '中科', yushengtang: '玉生堂' }[value] || value || '-'
 }
@@ -439,8 +436,10 @@ function ensureChart(instance, refValue) {
 function disposePatientCharts() {
   patientTrendChart?.dispose()
   patientSlotChart?.dispose()
+  patientOnlineAnalysisChart?.dispose()
   patientTrendChart = null
   patientSlotChart = null
+  patientOnlineAnalysisChart = null
 }
 
 function disposeDetailCharts() {
@@ -452,33 +451,35 @@ function disposeDetailCharts() {
   signalQualityChart = null
 }
 
-async function fetchPatientVisualization() {
+async function fetchPatientPulseSummary() {
   const userId = selectedUserId.value
   if (!userId) {
-    patientVisualization.value = null
+    patientPulseSummary.value = null
     return
   }
-  patientVisualizationLoading.value = true
+  patientSummaryLoading.value = true
   try {
-    const payload = await api.pulseUserVisualization({ user_id: userId })
+    const payload = await api.pulseUserSummary({ user_id: userId })
     if (selectedUserId.value === userId) {
-      patientVisualization.value = payload?.available ? payload : null
+      patientPulseSummary.value = payload?.available ? payload : null
     }
   } catch (error) {
     if (selectedUserId.value === userId) {
-      patientVisualization.value = null
+      patientPulseSummary.value = null
     }
   } finally {
     if (selectedUserId.value === userId) {
-      patientVisualizationLoading.value = false
+      patientSummaryLoading.value = false
     }
   }
+  await nextTick()
+  renderPatientOnlineAnalysisChart()
 }
 
 function selectPatient(userId) {
   selectedUserId.value = userId
   selectedRecord.value = selectedPatientRecords.value.at(-1) || null
-  fetchPatientVisualization()
+  fetchPatientPulseSummary()
   nextTick(() => {
     renderPatientCharts()
     renderDetailCharts()
@@ -526,6 +527,7 @@ function renderPatientCharts() {
   if (viewMode.value !== 'patients') return
   renderPatientTrendChart()
   renderPatientSlotChart()
+  renderPatientOnlineAnalysisChart()
 }
 
 function renderPatientTrendChart() {
@@ -560,6 +562,98 @@ function renderPatientSlotChart() {
     series: [
       { name: '脉率', type: 'bar', data: rows.map((row) => row.pulse_rate), itemStyle: { color: '#2f7d79', borderRadius: [4, 4, 0, 0] } },
       { name: '稳定性', type: 'bar', data: rows.map((row) => row.stability_score), itemStyle: { color: '#d6a13d', borderRadius: [4, 4, 0, 0] } }
+    ]
+  }, true)
+}
+
+function renderPatientOnlineAnalysisChart() {
+  patientOnlineAnalysisChart = ensureChart(patientOnlineAnalysisChart, patientOnlineAnalysisChartRef.value)
+  if (!patientOnlineAnalysisChart) return
+  const payload = patientPulseSummary.value
+  if (!payload?.available) {
+    patientOnlineAnalysisChart.clear()
+    return
+  }
+  const channels = ['cun', 'guan', 'chi']
+  const channelNames = { cun: 'Cun', guan: 'Guan', chi: 'Chi' }
+  const colors = { cun: '#2563eb', guan: '#16a34a', chi: '#dc2626' }
+  const longitudinalRows = payload.longitudinal || []
+  const dates = [...new Set(longitudinalRows.map((row) => formatDateTimeLabel(row.start_time)))]
+  const scatterRows = payload.quality_scatter || []
+  const waveforms = payload.waveforms || []
+  const templates = payload.templates || []
+  const maxWaveformLength = Math.max(0, ...waveforms.map((row) => row.points?.length || 0))
+  const maxTemplateLength = Math.max(0, ...templates.map((row) => row.points?.length || 0))
+  patientOnlineAnalysisChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0, right: 0 },
+    grid: [
+      { left: 48, top: 48, width: '42%', height: 170 },
+      { right: 24, top: 48, width: '42%', height: 170 },
+      { left: 48, bottom: 44, width: '42%', height: 170 },
+      { right: 24, bottom: 44, width: '42%', height: 170 }
+    ],
+    title: [
+      { text: '纵向周期 SNR', left: 0, top: 12, textStyle: { fontSize: 13, fontWeight: 600 } },
+      { text: '能量与疑似未对准', left: '52%', top: 12, textStyle: { fontSize: 13, fontWeight: 600 } },
+      { text: '示例记录预览波形', left: 0, top: '52%', textStyle: { fontSize: 13, fontWeight: 600 } },
+      { text: '示例记录归一化模板', left: '52%', top: '52%', textStyle: { fontSize: 13, fontWeight: 600 } }
+    ],
+    xAxis: [
+      { type: 'category', gridIndex: 0, data: dates, axisLabel: { rotate: 25, fontSize: 10 } },
+      { type: 'value', gridIndex: 1, name: 'energy' },
+      { type: 'category', gridIndex: 2, data: Array.from({ length: maxWaveformLength }, (_, index) => index + 1), axisLabel: { fontSize: 10 } },
+      { type: 'category', gridIndex: 3, data: Array.from({ length: maxTemplateLength }, (_, index) => index + 1), axisLabel: { fontSize: 10 } }
+    ],
+    yAxis: [
+      { type: 'value', gridIndex: 0, name: 'SNR' },
+      { type: 'value', gridIndex: 1, name: 'score' },
+      { type: 'value', gridIndex: 2 },
+      { type: 'value', gridIndex: 3 }
+    ],
+    series: [
+      ...channels.map((channel) => ({
+        name: `${channelNames[channel]} SNR`,
+        type: 'line',
+        smooth: true,
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        symbolSize: 5,
+        data: dates.map((date) => {
+          const row = longitudinalRows.find((item) => item.channel === channel && formatDateTimeLabel(item.start_time) === date)
+          return row ? row.periodic_snr : null
+        }),
+        itemStyle: { color: colors[channel] }
+      })),
+      ...channels.map((channel) => ({
+        name: `${channelNames[channel]} alignment`,
+        type: 'scatter',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        symbolSize: 6,
+        data: scatterRows
+          .filter((row) => row.channel === channel)
+          .map((row) => [row.pulse_energy, row.alignment_suspicion_score]),
+        itemStyle: { color: colors[channel], opacity: 0.72 }
+      })),
+      ...waveforms.map((row) => ({
+        name: `${channelNames[row.channel] || row.channel} waveform`,
+        type: 'line',
+        xAxisIndex: 2,
+        yAxisIndex: 2,
+        showSymbol: false,
+        data: row.points || [],
+        itemStyle: { color: colors[row.channel] }
+      })),
+      ...templates.map((row) => ({
+        name: `${channelNames[row.channel] || row.channel} template`,
+        type: 'line',
+        xAxisIndex: 3,
+        yAxisIndex: 3,
+        symbolSize: 4,
+        data: row.points || [],
+        itemStyle: { color: colors[row.channel] }
+      }))
     ]
   }, true)
 }
@@ -738,6 +832,7 @@ function renderSignalQualityChart() {
 function resizeCharts() {
   patientTrendChart?.resize()
   patientSlotChart?.resize()
+  patientOnlineAnalysisChart?.resize()
   waveformChart?.resize()
   recordFeatureChart?.resize()
   signalQualityChart?.resize()
@@ -754,7 +849,7 @@ onMounted(async () => {
     pulseRecords.value = pulsePayload
     selectedUserId.value = patientSummaries.value[0]?.user_id || users.value[0]?.user_id || ''
     selectedRecord.value = selectedPatientRecords.value.at(-1) || null
-    await fetchPatientVisualization()
+    await fetchPatientPulseSummary()
   } finally {
     loading.value = false
   }
@@ -766,7 +861,7 @@ onMounted(async () => {
 watch([selectedUserId, pulseRecords], async () => {
   recordPage.value = 1
   selectedRecord.value = selectedPatientRecords.value.at(-1) || null
-  fetchPatientVisualization()
+  fetchPatientPulseSummary()
   await nextTick()
   renderPatientCharts()
   renderDetailCharts()
@@ -1026,13 +1121,11 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
-.patient-visualization-image {
+.patient-online-analysis-chart {
   background: #fff;
   border: 1px solid #eef2f1;
   border-radius: 4px;
-  display: block;
-  max-height: 520px;
-  object-fit: contain;
+  height: 500px;
   width: 100%;
 }
 

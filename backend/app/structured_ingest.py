@@ -10,7 +10,8 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from backend.app.feature_wide import rebuild_visit_feature_wide
-from backend.app.models import Device, FeatureVariable, FileAsset, ModalityRecord, PulseMeasurement, PulsePositionFeature, PulseWaveformAsset, Visit
+from backend.app.models import AnalysisRun, Device, FeatureVariable, FileAsset, ModalityRecord, PulseMeasurement, PulseMeasurementQuality, PulsePositionFeature, PulseWaveformAsset, Visit
+from backend.app.pulse_analysis_engine import analyze_preview_signal, classify_channel, standard_channel_name, summarize_measurement_quality
 from backend.app.structured_parser import build_structured_modalities
 
 MODALITIES = ["ask", "pulse", "tongue", "face", "voice", "report"]
@@ -165,6 +166,14 @@ def _pulse_analysis_tables_available(session: Session) -> bool:
     return True
 
 
+def _pulse_online_analysis_tables_available(session: Session) -> bool:
+    required = ["analysis_run", "fact_pulse_measurement_quality", "fact_pulse_waveform_asset"]
+    for table_name in required:
+        if _scalar(session, select(func.to_regclass(table_name))) is None:
+            return False
+    return True
+
+
 def _sync_waveform_asset(session: Session, measurement_id: uuid.UUID, record: dict[str, Any]) -> int:
     waveform_preview = record.get("waveform_preview") or []
     waveform_summary = record.get("waveform_summary") or {}
@@ -254,6 +263,80 @@ def _sync_position_features(session: Session, measurement_id: uuid.UUID, record:
     return count
 
 
+def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUID]) -> int:
+    if not measurement_ids or not _pulse_online_analysis_tables_available(session):
+        return 0
+
+    measurements = {
+        measurement.measurement_id: measurement
+        for measurement in _scalars(session, select(PulseMeasurement).where(PulseMeasurement.measurement_id.in_(measurement_ids)))
+    }
+    waveforms = _scalars(
+        session,
+        select(PulseWaveformAsset)
+        .where(PulseWaveformAsset.measurement_id.in_(measurement_ids))
+        .order_by(PulseWaveformAsset.measurement_id, PulseWaveformAsset.channel_name),
+    )
+    grouped: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for waveform in waveforms:
+        measurement = measurements.get(waveform.measurement_id)
+        if measurement is None:
+            continue
+        metrics = analyze_preview_signal(waveform.preview_json, float(measurement.duration_seconds) if measurement.duration_seconds else None)
+        row = {
+            "measurement_id": str(waveform.measurement_id),
+            "waveform_asset_id": str(waveform.waveform_asset_id),
+            "channel_name": waveform.channel_name,
+            "standard_channel_name": standard_channel_name(waveform.channel_name),
+            **{key: value for key, value in metrics.items() if key not in {"values", "template_vector", "normalized_template_vector"}},
+        }
+        grouped.setdefault(waveform.measurement_id, []).append(row)
+
+    if not grouped:
+        return 0
+
+    analysis_run = AnalysisRun(
+        analysis_type="pulse_online_ingest_analysis",
+        code_version="pulse_analysis_engine_v1",
+        parameter_json={"trigger": "parse_structured_data"},
+        status="completed",
+        result_summary_json={"measurement_count": len(grouped)},
+    )
+    session.add(analysis_run)
+    session.flush()
+
+    inserted = 0
+    for measurement_id, rows in grouped.items():
+        energies = [float(row["pulse_energy"]) for row in rows if row.get("pulse_energy")]
+        median_energy = sorted(energies)[len(energies) // 2] if energies else None
+        labelled_rows = []
+        for row in rows:
+            energy = row.get("pulse_energy")
+            energy_ratio = float(energy) / median_energy if energy and median_energy else None
+            labelled_rows.append({**row, "channel_energy_ratio_to_median": energy_ratio, **classify_channel(row, energy_ratio)})
+        summary = summarize_measurement_quality(
+            labelled_rows,
+            float(measurements[measurement_id].duration_seconds) if measurements.get(measurement_id) and measurements[measurement_id].duration_seconds else None,
+        )
+        session.add(
+            PulseMeasurementQuality(
+                analysis_run_id=analysis_run.analysis_run_id,
+                measurement_id=measurement_id,
+                stable_segment_ratio=None,
+                best_segment_quality_score=summary.get("signal_quality_score"),
+                signal_quality_score=summary.get("signal_quality_score"),
+                measurement_validity_label=summary.get("measurement_validity_label"),
+                result_json={
+                    **summary,
+                    "channel_rows": labelled_rows,
+                },
+            )
+        )
+        inserted += 1
+    analysis_run.result_summary_json = {"measurement_count": inserted}
+    return inserted
+
+
 def sync_pulse_analysis_tables(session: Session, visits: list[Visit]) -> dict[str, int | bool]:
     result: dict[str, int | bool] = {
         "pulse_analysis_sync_skipped": False,
@@ -261,8 +344,10 @@ def sync_pulse_analysis_tables(session: Session, visits: list[Visit]) -> dict[st
         "pulse_waveforms_inserted": 0,
         "pulse_position_features_inserted": 0,
         "pulse_feature_variables_upserted": 0,
+        "pulse_online_analysis_rows": 0,
     }
     observed_features: set[str] = set()
+    synced_measurement_ids: list[uuid.UUID] = []
     if not _pulse_analysis_tables_available(session):
         result["pulse_analysis_sync_skipped"] = True
         return result
@@ -336,6 +421,7 @@ def sync_pulse_analysis_tables(session: Session, visits: list[Visit]) -> dict[st
                         },
                     )
                     actual_measurement_id = session.execute(stmt.returning(PulseMeasurement.measurement_id)).scalar_one()
+                    synced_measurement_ids.append(actual_measurement_id)
                     result["pulse_measurements_upserted"] = int(result["pulse_measurements_upserted"]) + 1
                     session.execute(delete(PulseWaveformAsset).where(PulseWaveformAsset.measurement_id == actual_measurement_id))
                     session.execute(delete(PulsePositionFeature).where(PulsePositionFeature.measurement_id == actual_measurement_id))
@@ -343,6 +429,7 @@ def sync_pulse_analysis_tables(session: Session, visits: list[Visit]) -> dict[st
                     result["pulse_position_features_inserted"] = int(result["pulse_position_features_inserted"]) + _sync_position_features(session, actual_measurement_id, record)
         _upsert_feature_variables(session, observed_features)
         result["pulse_feature_variables_upserted"] = len(observed_features)
+        result["pulse_online_analysis_rows"] = _sync_pulse_online_analysis(session, synced_measurement_ids)
     except ProgrammingError as exc:
         session.rollback()
         if any(name in str(exc) for name in ("fact_pulse_measurement", "dim_device", "dim_feature_variable")):
@@ -389,6 +476,7 @@ def parse_structured_data(session: Session, payload: dict[str, Any] | None = Non
         "pulse_waveforms_inserted": 0,
         "pulse_position_features_inserted": 0,
         "pulse_feature_variables_upserted": 0,
+        "pulse_online_analysis_rows": 0,
     }
 
     for visit in visits:

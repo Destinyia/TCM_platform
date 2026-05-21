@@ -284,9 +284,9 @@ storage/datasets/DS-PULSE-PHASE1/v2026.05.phase1.001/analysis/phase1/
 | `feature_risks` | 特征可靠性风险排序，来自 `feature_reliability.csv` |
 | `quality_drift_scatter` | 质量分与漂移指数散点采样 |
 
-### 5.2 `GET /api/pulse/analysis/user-visualization`
+### 5.2 `GET /api/pulse/analysis/user-summary`
 
-用途：查询某个用户是否已有离线生成的单用户脉诊可视化图片，供 `/pulse-analysis` 患者 summary 区展示。
+用途：在线计算某个用户的脉诊 summary 可视化数据，供 `/pulse-analysis` 患者 summary 区用 ECharts 渲染。该接口不依赖离线脚本生成的 PNG；算法来自平台内置 `backend/app/pulse_analysis_engine.py`。
 
 Query：
 | 参数 | 说明 |
@@ -297,16 +297,15 @@ Query：
 | 字段 | 说明 |
 | --- | --- |
 | `available` | 是否存在该用户的可视化结果 |
-| `image_url` | 图片读取接口路径，存在结果时返回 |
 | `selected_measurement_id` | 可视化中选用的示例 measurement |
 | `patient_measurements` / `patient_channel_rows` / `patient_periodic_rows` | 用户级样本统计 |
 | `patient_avg_periodic_snr` | 用户三通道平均周期信噪比 |
+| `longitudinal` | 通道级纵向周期 SNR 序列 |
+| `quality_scatter` | 能量与疑似未对准评分散点数据 |
+| `waveforms` | 示例 measurement 的三通道预览波形 |
+| `templates` | 示例 measurement 的三通道归一化模板 |
 
-### 5.3 `GET /api/pulse/analysis/user-visualization/{user_id}/image`
-
-用途：返回离线生成的单用户脉诊可视化 PNG 文件。
-
-### 5.4 `GET /api/pulse/measurements`
+### 5.3 `GET /api/pulse/measurements`
 
 用途：查询脉诊 measurement 样本主表。
 
@@ -336,23 +335,23 @@ Query：
 | `quality_status` / `quality_flags` | 质量状态 |
 | `feature_json` | measurement 级特征摘要 |
 
-### 5.5 `GET /api/pulse/measurements/{measurement_id}`
+### 5.4 `GET /api/pulse/measurements/{measurement_id}`
 
 用途：查询单次脉诊 measurement 详情。
 
-### 5.6 `GET /api/pulse/measurements/{measurement_id}/waveforms`
+### 5.5 `GET /api/pulse/measurements/{measurement_id}/waveforms`
 
 用途：查询单次测量的波形资产索引和预览点。
 
 返回字段来自 `fact_pulse_waveform_asset`，包括 `channel_name`、`sample_count`、`sampling_rate`、`storage_uri`、`data_format`、`preview_json`、`summary_json`。
 
-### 5.7 `GET /api/pulse/measurements/{measurement_id}/position-features`
+### 5.6 `GET /api/pulse/measurements/{measurement_id}/position-features`
 
 用途：查询单次测量的部位级特征明细。
 
 返回字段来自 `fact_pulse_position_feature`，包括 `hand_side`、`pulse_position`、`feature_name`、`feature_value`、`source_field`、`parser_version`、`quality_weight`。
 
-### 5.8 `GET /api/pulse/features`
+### 5.7 `GET /api/pulse/features`
 
 用途：查询 measurement 级扁平特征行。
 
@@ -362,7 +361,7 @@ Query：
 | --- | --- |
 | `feature_name` | 可选，按变量名过滤 |
 
-### 5.9 `GET /api/pulse/feature-variables`
+### 5.8 `GET /api/pulse/feature-variables`
 
 用途：查询脉诊变量字典。
 

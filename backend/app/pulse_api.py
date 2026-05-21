@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request
 from sqlalchemy import select
 
 import pandas as pd
 
 from backend.app.config import PROJECT_ROOT
 from backend.app.database import SessionLocal, get_engine
+from backend.app.pulse_analysis_engine import (
+    CHANNEL_ORDER,
+    analyze_preview_signal,
+    classify_channel,
+    standard_channel_name,
+    summarize_measurement_quality,
+)
 from backend.app.models import (
     Device,
     FeatureVariable,
@@ -156,26 +162,6 @@ def _load_phase1_analysis(dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> dict:
     }
 
 
-def _visualization_summary_for_user(user_id: str, dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> tuple[dict | None, Path | None]:
-    visualization_dir = dataset_dir / "analysis" / "phase1" / "visualizations"
-    if not visualization_dir.exists():
-        return None, None
-    for summary_path in visualization_dir.glob("patient_*_pulse_phase2_3_summary.json"):
-        try:
-            payload = json.loads(summary_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if str(payload.get("selected_user_id")) != str(user_id):
-            continue
-        image_path = Path(payload.get("image_path") or "")
-        if not image_path.is_absolute():
-            image_path = PROJECT_ROOT / image_path
-        if not image_path.exists():
-            return payload, None
-        return payload, image_path
-    return None, None
-
-
 def measurement_payload(measurement: PulseMeasurement, visit: Visit, user: User, device: Device | None) -> dict:
     features = measurement.feature_json or {}
     return {
@@ -219,47 +205,145 @@ def phase1_analysis_summary():
     return jsonify(_load_phase1_analysis(path))
 
 
-@pulse_api.route("/analysis/user-visualization", methods=["GET"])
-def user_visualization_summary():
+def _round_vector(values: list[float], digits: int = 6) -> list[float]:
+    return [round(float(value), digits) for value in values]
+
+
+@pulse_api.route("/analysis/user-summary", methods=["GET"])
+def user_pulse_analysis_summary():
     user_id = request.args.get("user_id")
     if not user_id:
         return jsonify({"available": False, "message": "user_id is required"}), 400
-    dataset_dir = request.args.get("dataset_dir")
-    path = Path(dataset_dir) if dataset_dir else PULSE_PHASE1_DATASET_DIR
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    payload, image_path = _visualization_summary_for_user(user_id, path)
-    if not payload or not image_path:
-        return jsonify(
+    get_engine()
+    with SessionLocal() as session:
+        measurements = session.execute(
+            select(PulseMeasurement)
+            .where(PulseMeasurement.user_id == UUID(user_id))
+            .order_by(PulseMeasurement.start_time, PulseMeasurement.measurement_id)
+        ).scalars().all()
+        if not measurements:
+            return jsonify({"available": False, "user_id": user_id, "message": "pulse measurements not found"})
+        measurement_map = {measurement.measurement_id: measurement for measurement in measurements}
+        waveforms = session.execute(
+            select(PulseWaveformAsset)
+            .where(PulseWaveformAsset.measurement_id.in_(list(measurement_map)))
+            .order_by(PulseWaveformAsset.measurement_id, PulseWaveformAsset.channel_name)
+        ).scalars().all()
+
+    raw_rows = []
+    for waveform in waveforms:
+        measurement = measurement_map.get(waveform.measurement_id)
+        if measurement is None:
+            continue
+        channel = standard_channel_name(waveform.channel_name)
+        if channel not in {*CHANNEL_ORDER, "overall"}:
+            continue
+        duration = as_json(measurement.duration_seconds)
+        duration_number = _clean_number(duration, 6) if duration is not None else None
+        metrics = analyze_preview_signal(waveform.preview_json, duration_number)
+        raw_rows.append(
             {
-                "available": False,
-                "user_id": user_id,
-                "analysis_dir": str(path / "analysis" / "phase1"),
-                "message": "single-user pulse visualization not found",
+                "measurement_id": str(waveform.measurement_id),
+                "waveform_asset_id": str(waveform.waveform_asset_id),
+                "start_time": as_json(measurement.start_time),
+                "visit_slot": measurement.visit_slot,
+                "channel_name": waveform.channel_name,
+                "standard_channel_name": channel,
+                "duration_seconds": duration_number,
+                "values": metrics.get("values") or [],
+                "template_vector": metrics.get("template_vector") or [],
+                "normalized_template_vector": metrics.get("normalized_template_vector") or [],
+                **{key: value for key, value in metrics.items() if key not in {"values", "template_vector", "normalized_template_vector"}},
             }
         )
+
+    if not raw_rows:
+        return jsonify({"available": False, "user_id": user_id, "message": "pulse waveform previews not found"})
+
+    medians: dict[str, float] = {}
+    for channel in {*CHANNEL_ORDER, "overall"}:
+        energies = sorted(
+            safe_value
+            for safe_value in (_clean_number(row.get("pulse_energy"), 12) for row in raw_rows if row["standard_channel_name"] == channel)
+            if safe_value is not None and safe_value > 0
+        )
+        if energies:
+            medians[channel] = energies[len(energies) // 2]
+
+    rows = []
+    for row in raw_rows:
+        energy = _clean_number(row.get("pulse_energy"), 12)
+        median = medians.get(row["standard_channel_name"])
+        energy_ratio = energy / median if energy is not None and median else None
+        labels = classify_channel(row, energy_ratio)
+        rows.append({**row, "channel_energy_ratio_to_median": energy_ratio, **labels})
+
+    measurement_groups: dict[str, list[dict]] = {}
+    for row in rows:
+        measurement_groups.setdefault(row["measurement_id"], []).append(row)
+    measurement_summaries = {
+        measurement_id: summarize_measurement_quality(group, group[0].get("duration_seconds"))
+        for measurement_id, group in measurement_groups.items()
+    }
+    ranked_measurements = sorted(
+        measurement_groups.items(),
+        key=lambda item: (
+            sum(1 for row in item[1] if row.get("periodic_signal_label") in {"clear_periodic", "weak_periodic"}),
+            sum((_clean_number(row.get("periodic_snr"), 6) or 0.0) for row in item[1]) / max(1, len(item[1])),
+        ),
+        reverse=True,
+    )
+    selected_measurement_id, selected_rows = ranked_measurements[0]
+    selected_measurement = measurement_map.get(UUID(selected_measurement_id))
+    core_rows = [row for row in rows if row["standard_channel_name"] in CHANNEL_ORDER]
+    periodic_rows = [row for row in core_rows if row.get("periodic_signal_label") in {"clear_periodic", "weak_periodic"}]
+    avg_snr = sum(_clean_number(row.get("periodic_snr"), 6) or 0.0 for row in core_rows) / len(core_rows) if core_rows else None
+
+    longitudinal = [
+        {
+            "measurement_id": row["measurement_id"],
+            "start_time": row["start_time"],
+            "visit_slot": row.get("visit_slot"),
+            "channel": row["standard_channel_name"],
+            "periodic_snr": _clean_number(row.get("periodic_snr"), 6),
+            "periodic_signal_label": row.get("periodic_signal_label"),
+        }
+        for row in core_rows
+    ]
+    quality_scatter = [
+        {
+            "measurement_id": row["measurement_id"],
+            "start_time": row["start_time"],
+            "channel": row["standard_channel_name"],
+            "pulse_energy": _clean_number(row.get("pulse_energy"), 8),
+            "alignment_suspicion_score": _clean_number(row.get("alignment_suspicion_score"), 3),
+        }
+        for row in core_rows
+    ]
+    selected_core_rows = [row for row in selected_rows if row["standard_channel_name"] in CHANNEL_ORDER]
     return jsonify(
         {
             "available": True,
             "user_id": user_id,
-            "image_url": f"/api/pulse/analysis/user-visualization/{user_id}/image",
-            "selected_measurement_id": payload.get("selected_measurement_id"),
-            "selected_measurement_start_time": payload.get("selected_measurement_start_time"),
-            "patient_measurements": payload.get("patient_measurements"),
-            "patient_channel_rows": payload.get("patient_channel_rows"),
-            "patient_periodic_rows": payload.get("patient_periodic_rows"),
-            "patient_avg_periodic_snr": payload.get("patient_avg_periodic_snr"),
-            "created_at": payload.get("created_at"),
+            "patient_measurements": len(measurements),
+            "patient_channel_rows": len(core_rows),
+            "patient_periodic_rows": len(periodic_rows),
+            "patient_avg_periodic_snr": _clean_number(avg_snr, 6),
+            "selected_measurement_id": selected_measurement_id,
+            "selected_measurement_start_time": as_json(selected_measurement.start_time) if selected_measurement else None,
+            "selected_measurement_quality": measurement_summaries.get(selected_measurement_id),
+            "longitudinal": longitudinal,
+            "quality_scatter": quality_scatter,
+            "waveforms": [
+                {"channel": row["standard_channel_name"], "points": _round_vector(row.get("values") or [])}
+                for row in selected_core_rows
+            ],
+            "templates": [
+                {"channel": row["standard_channel_name"], "points": _round_vector(row.get("normalized_template_vector") or [])}
+                for row in selected_core_rows
+            ],
         }
     )
-
-
-@pulse_api.route("/analysis/user-visualization/<user_id>/image", methods=["GET"])
-def user_visualization_image(user_id: str):
-    payload, image_path = _visualization_summary_for_user(user_id)
-    if not payload or not image_path:
-        return jsonify({"message": "single-user pulse visualization not found"}), 404
-    return send_file(image_path, mimetype="image/png")
 
 
 @pulse_api.route("/measurements", methods=["GET"])
