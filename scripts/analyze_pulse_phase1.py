@@ -12,6 +12,7 @@ import pandas as pd
 
 QUALITY_FEATURES = ["stability_score"]
 CORE_FEATURES = ["pulse_rate", "force", "tension", "fluency", "amplitude", "h1", "h3", "w", "as", "ad", "stability_score"]
+CHANNEL_ORDER = ["cun", "guan", "chi"]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -56,6 +57,139 @@ def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
 
 
+def parse_json_value(value: Any, default: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value if value is not None else default
+
+
+def extract_preview_values(row: dict[str, Any]) -> list[float]:
+    preview = parse_json_value(row.get("preview_json"), [])
+    if isinstance(preview, dict) and isinstance(preview.get("points"), list):
+        raw_values = preview["points"]
+    elif isinstance(preview, list):
+        raw_values = preview
+    else:
+        raw_values = []
+
+    y_values = []
+    for point in raw_values:
+        if isinstance(point, dict):
+            y_values.append(safe_float(point.get("y")))
+        else:
+            y_values.append(safe_float(point))
+    return [value for value in y_values if value is not None]
+
+
+def standard_channel_name(channel_name: Any) -> str:
+    value = str(channel_name or "").strip().lower()
+    if value in {"cun", "寸"}:
+        return "cun"
+    if value in {"guan", "guanmai", "guan_mai", "关", "關"}:
+        return "guan"
+    if value in {"chi", "尺"}:
+        return "chi"
+    if value in {"singlepluse", "singlepulse", "single_pulse", "overall"}:
+        return "overall"
+    return value or "unknown"
+
+
+def percentile(values: list[float], ratio: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * ratio
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] * (upper - index) + ordered[upper] * (index - lower)
+
+
+def mean_std(values: list[float]) -> tuple[float | None, float | None]:
+    if not values:
+        return None, None
+    mean = sum(values) / len(values)
+    if len(values) < 2:
+        return mean, 0.0
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return mean, math.sqrt(max(0.0, variance))
+
+
+def linear_detrend(values: list[float]) -> list[float]:
+    if len(values) < 2:
+        return values[:]
+    n = len(values)
+    x_mean = (n - 1) / 2
+    y_mean = sum(values) / n
+    denominator = sum((index - x_mean) ** 2 for index in range(n))
+    slope = sum((index - x_mean) * (value - y_mean) for index, value in enumerate(values)) / denominator if denominator else 0.0
+    intercept = y_mean - slope * x_mean
+    return [value - (intercept + slope * index) for index, value in enumerate(values)]
+
+
+def autocorrelation_peak(values: list[float]) -> tuple[float, int | None]:
+    if len(values) < 16:
+        return 0.0, None
+    _, value_std = mean_std(values)
+    if not value_std:
+        return 0.0, None
+    centered = [value - (sum(values) / len(values)) for value in values]
+    denominator = sum(value * value for value in centered)
+    if denominator <= 0:
+        return 0.0, None
+
+    max_lag = min(28, max(3, len(values) // 2))
+    best_corr = 0.0
+    best_lag = None
+    for lag in range(3, max_lag + 1):
+        numerator = sum(centered[index] * centered[index - lag] for index in range(lag, len(centered)))
+        corr = numerator / denominator
+        if corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+    return best_corr, best_lag
+
+
+def preview_channel_metrics(values: list[float]) -> dict[str, Any]:
+    if len(values) < 16:
+        return {
+            "preview_point_count": len(values),
+            "pulse_energy": None,
+            "residual_fluctuation": None,
+            "template_coherence": None,
+            "periodic_snr": None,
+            "dominant_lag_preview_points": None,
+        }
+
+    detrended = linear_detrend(values)
+    p05 = percentile(values, 0.05) or min(values)
+    p95 = percentile(values, 0.95) or max(values)
+    amplitude_range = max(0.0, p95 - p05)
+    _, residual_std = mean_std(detrended)
+    diffs = [detrended[index] - detrended[index - 1] for index in range(1, len(detrended))]
+    _, diff_std = mean_std(diffs)
+    template_coherence, dominant_lag = autocorrelation_peak(detrended)
+
+    residual_std = residual_std or 0.0
+    diff_std = diff_std or 0.0
+    pulse_energy = residual_std * residual_std
+    residual_fluctuation = diff_std / (amplitude_range + 1e-9) if amplitude_range else 1.0
+    periodic_snr = max(0.0, template_coherence) * residual_std / (diff_std + 1e-9)
+
+    return {
+        "preview_point_count": len(values),
+        "pulse_energy": pulse_energy,
+        "residual_fluctuation": residual_fluctuation,
+        "template_coherence": template_coherence,
+        "periodic_snr": periodic_snr,
+        "dominant_lag_preview_points": dominant_lag,
+    }
+
+
 def load_feature_matrix(dataset_dir: Path) -> pd.DataFrame:
     measurements = read_table(dataset_dir, "measurements")
     features = read_table(dataset_dir, "measurement_features")
@@ -78,32 +212,8 @@ def waveform_metrics(dataset_dir: Path) -> pd.DataFrame:
     rows = read_jsonl(dataset_dir / "waveform_manifest.jsonl")
     result = []
     for row in rows:
-        preview = row.get("preview_json")
-        if isinstance(preview, str):
-            try:
-                preview = json.loads(preview)
-            except json.JSONDecodeError:
-                preview = []
-        preview = preview or []
-        if isinstance(preview, dict) and isinstance(preview.get("points"), list):
-            raw_values = preview["points"]
-        elif isinstance(preview, list):
-            raw_values = preview
-        else:
-            raw_values = []
-        y_values = []
-        for point in raw_values:
-            if isinstance(point, dict):
-                y_values.append(safe_float(point.get("y")))
-            else:
-                y_values.append(safe_float(point))
-        y_values = [value for value in y_values if value is not None]
-        summary = row.get("summary_json")
-        if isinstance(summary, str):
-            try:
-                summary = json.loads(summary)
-            except json.JSONDecodeError:
-                summary = {}
+        y_values = extract_preview_values(row)
+        summary = parse_json_value(row.get("summary_json"), {})
         summary = summary if isinstance(summary, dict) else {}
 
         if len(y_values) >= 2:
@@ -157,10 +267,203 @@ def waveform_metrics(dataset_dir: Path) -> pd.DataFrame:
     )
 
 
-def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd.DataFrame) -> pd.DataFrame:
+def analyze_channel_signal_quality(dataset_dir: Path, feature_matrix: pd.DataFrame) -> pd.DataFrame:
+    rows = read_jsonl(dataset_dir / "waveform_manifest.jsonl")
+    if not rows:
+        return pd.DataFrame()
+
+    metadata_columns = [
+        "measurement_id",
+        "user_id",
+        "source_vendor",
+        "device_id",
+        "visit_slot",
+        "start_time",
+        "duration_seconds",
+    ]
+    metadata = pd.DataFrame()
+    if not feature_matrix.empty:
+        available_columns = [column for column in metadata_columns if column in feature_matrix.columns]
+        metadata = feature_matrix[available_columns].drop_duplicates("measurement_id") if "measurement_id" in available_columns else pd.DataFrame()
+
+    records = []
+    for row in rows:
+        summary = parse_json_value(row.get("summary_json"), {})
+        summary = summary if isinstance(summary, dict) else {}
+        values = extract_preview_values(row)
+        metrics = preview_channel_metrics(values)
+        sample_count = safe_float(row.get("sample_count")) or safe_float(summary.get("count"))
+        sampling_rate = safe_float(row.get("sampling_rate")) or safe_float(summary.get("sampling_rate"))
+        duration_seconds = safe_float(row.get("duration_seconds")) or safe_float(summary.get("duration_seconds"))
+        if duration_seconds is None and sample_count and sampling_rate:
+            duration_seconds = sample_count / sampling_rate
+
+        records.append(
+            {
+                "measurement_id": row.get("measurement_id"),
+                "waveform_asset_id": row.get("waveform_asset_id"),
+                "channel_name": row.get("channel_name"),
+                "standard_channel_name": standard_channel_name(row.get("channel_name")),
+                "hand_side": row.get("hand_side"),
+                "pulse_position": row.get("pulse_position"),
+                "sample_count": sample_count,
+                "sampling_rate": sampling_rate,
+                "duration_seconds": duration_seconds,
+                "data_format": row.get("data_format"),
+                "storage_uri": row.get("storage_uri"),
+                **metrics,
+            }
+        )
+
+    frame = pd.DataFrame(records)
+    if not metadata.empty:
+        frame = frame.merge(metadata, on="measurement_id", how="left", suffixes=("", "_measurement"))
+        if "duration_seconds_measurement" in frame:
+            frame["duration_seconds"] = pd.to_numeric(frame["duration_seconds"], errors="coerce").fillna(
+                pd.to_numeric(frame["duration_seconds_measurement"], errors="coerce")
+            )
+            frame = frame.drop(columns=["duration_seconds_measurement"])
+
+    frame["pulse_energy"] = pd.to_numeric(frame["pulse_energy"], errors="coerce")
+    frame["template_coherence"] = pd.to_numeric(frame["template_coherence"], errors="coerce")
+    frame["periodic_snr"] = pd.to_numeric(frame["periodic_snr"], errors="coerce")
+    frame["residual_fluctuation"] = pd.to_numeric(frame["residual_fluctuation"], errors="coerce")
+
+    median_energy = frame.groupby("standard_channel_name")["pulse_energy"].transform("median")
+    frame["channel_energy_ratio_to_median"] = frame["pulse_energy"] / median_energy.where(median_energy > 0)
+
+    labels = []
+    suspicion_scores = []
+    for _, row in frame.iterrows():
+        preview_count = safe_float(row.get("preview_point_count")) or 0
+        energy_ratio = safe_float(row.get("channel_energy_ratio_to_median"))
+        coherence = safe_float(row.get("template_coherence")) or 0.0
+        snr = safe_float(row.get("periodic_snr")) or 0.0
+        fluctuation = safe_float(row.get("residual_fluctuation")) or 1.0
+
+        if preview_count < 16:
+            suspicion = 100.0
+            label = "insufficient_preview"
+        else:
+            flat_penalty = clamp(((0.35 - (energy_ratio or 0.0)) / 0.35) * 45, 0, 45) if energy_ratio is not None else 20.0
+            periodic_penalty = clamp(((0.18 - coherence) / 0.18) * 35, 0, 35)
+            snr_penalty = clamp(((0.15 - snr) / 0.15) * 20, 0, 20)
+            fluctuation_penalty = clamp((fluctuation - 0.7) * 20, 0, 15)
+            suspicion = flat_penalty + periodic_penalty + snr_penalty + fluctuation_penalty
+            if suspicion >= 60:
+                label = "suspected_misalignment"
+            elif snr < 0.08 or coherence < 0.08:
+                label = "low_snr"
+            else:
+                label = "valid"
+        labels.append(label)
+        suspicion_scores.append(round(suspicion, 3))
+
+    frame["alignment_suspicion_score"] = suspicion_scores
+    frame["channel_validity_label"] = labels
+    numeric_columns = [
+        "pulse_energy",
+        "residual_fluctuation",
+        "template_coherence",
+        "periodic_snr",
+        "channel_energy_ratio_to_median",
+        "sample_count",
+        "sampling_rate",
+        "duration_seconds",
+    ]
+    for column in numeric_columns:
+        if column in frame:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").round(6)
+    return frame
+
+
+def summarize_measurement_channels(channel_quality: pd.DataFrame) -> pd.DataFrame:
+    if channel_quality.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for measurement_id, group in channel_quality.groupby("measurement_id", dropna=False):
+        row: dict[str, Any] = {"measurement_id": measurement_id}
+        core = group[group["standard_channel_name"].isin(CHANNEL_ORDER)].copy()
+        usable = core if not core.empty else group
+        energy_values = pd.to_numeric(core["pulse_energy"], errors="coerce").dropna()
+        mean_energy = energy_values.mean() if not energy_values.empty else None
+        if mean_energy and mean_energy > 0 and len(energy_values) >= 2:
+            channel_balance_index = clamp(1 - float(energy_values.std(ddof=0) / mean_energy), 0, 1)
+        else:
+            channel_balance_index = None
+
+        row.update(
+            {
+                "valid_channel_count": int((usable["channel_validity_label"] == "valid").sum()),
+                "low_snr_channel_count": int((usable["channel_validity_label"] == "low_snr").sum()),
+                "suspected_alignment_channel_count": int((usable["channel_validity_label"] == "suspected_misalignment").sum()),
+                "insufficient_preview_channel_count": int((usable["channel_validity_label"] == "insufficient_preview").sum()),
+                "overall_periodic_snr": round(float(pd.to_numeric(usable["periodic_snr"], errors="coerce").mean()), 6),
+                "overall_pulse_energy": round(float(pd.to_numeric(usable["pulse_energy"], errors="coerce").mean()), 6),
+                "overall_template_coherence": round(float(pd.to_numeric(usable["template_coherence"], errors="coerce").mean()), 6),
+                "overall_alignment_suspicion_score": round(float(pd.to_numeric(usable["alignment_suspicion_score"], errors="coerce").mean()), 3),
+                "channel_balance_index": round(channel_balance_index, 6) if channel_balance_index is not None else None,
+            }
+        )
+        for channel in CHANNEL_ORDER:
+            match = core[core["standard_channel_name"] == channel]
+            if match.empty:
+                row[f"{channel}_periodic_snr"] = None
+                row[f"{channel}_pulse_energy"] = None
+                row[f"{channel}_template_coherence"] = None
+                row[f"{channel}_alignment_suspicion_score"] = None
+                row[f"{channel}_validity_label"] = None
+                continue
+            selected = match.iloc[0]
+            row[f"{channel}_periodic_snr"] = selected.get("periodic_snr")
+            row[f"{channel}_pulse_energy"] = selected.get("pulse_energy")
+            row[f"{channel}_template_coherence"] = selected.get("template_coherence")
+            row[f"{channel}_alignment_suspicion_score"] = selected.get("alignment_suspicion_score")
+            row[f"{channel}_validity_label"] = selected.get("channel_validity_label")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarize_longitudinal_channels(channel_quality: pd.DataFrame) -> pd.DataFrame:
+    if channel_quality.empty or "user_id" not in channel_quality:
+        return pd.DataFrame()
+    frame = channel_quality.dropna(subset=["user_id"]).copy()
+    if frame.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (user_id, channel), group in frame.groupby(["user_id", "standard_channel_name"], dropna=False):
+        periodic = pd.to_numeric(group["periodic_snr"], errors="coerce")
+        energy = pd.to_numeric(group["pulse_energy"], errors="coerce")
+        coherence = pd.to_numeric(group["template_coherence"], errors="coerce")
+        suspicion = pd.to_numeric(group["alignment_suspicion_score"], errors="coerce")
+        rows.append(
+            {
+                "user_id": user_id,
+                "standard_channel_name": channel,
+                "record_count": int(len(group)),
+                "valid_channel_count": int((group["channel_validity_label"] == "valid").sum()),
+                "low_snr_count": int((group["channel_validity_label"] == "low_snr").sum()),
+                "suspected_misalignment_count": int((group["channel_validity_label"] == "suspected_misalignment").sum()),
+                "avg_periodic_snr": round(float(periodic.mean()), 6) if periodic.notna().any() else None,
+                "best_periodic_snr": round(float(periodic.max()), 6) if periodic.notna().any() else None,
+                "avg_pulse_energy": round(float(energy.mean()), 6) if energy.notna().any() else None,
+                "avg_template_coherence": round(float(coherence.mean()), 6) if coherence.notna().any() else None,
+                "avg_alignment_suspicion_score": round(float(suspicion.mean()), 3) if suspicion.notna().any() else None,
+                "energy_cv": round(coefficient_of_variation(energy), 6) if coefficient_of_variation(energy) is not None else None,
+                "periodic_snr_cv": round(coefficient_of_variation(periodic), 6) if coefficient_of_variation(periodic) is not None else None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd.DataFrame, channel_summary: pd.DataFrame | None = None) -> pd.DataFrame:
     if feature_matrix.empty:
         return pd.DataFrame()
     frame = feature_matrix.merge(waveform_frame, on="measurement_id", how="left")
+    if channel_summary is not None and not channel_summary.empty:
+        frame = frame.merge(channel_summary, on="measurement_id", how="left")
     frame["stability_score"] = pd.to_numeric(frame["stability_score"], errors="coerce")
     frame["amplitude"] = pd.to_numeric(frame["amplitude"], errors="coerce")
     frame["duration_seconds"] = pd.to_numeric(frame["duration_seconds"], errors="coerce").fillna(0)
@@ -176,6 +479,21 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
     waveform_bonus = frame["has_waveform_preview"].map(lambda value: 5 if bool(value) else -10)
 
     signal_quality = (stability_component - drift_penalty - artifact_penalty + waveform_bonus).map(lambda value: clamp(float(value)))
+    has_channel_quality = "overall_periodic_snr" in frame
+    if has_channel_quality:
+        frame["overall_periodic_snr"] = pd.to_numeric(frame["overall_periodic_snr"], errors="coerce")
+        frame["overall_template_coherence"] = pd.to_numeric(frame["overall_template_coherence"], errors="coerce")
+        frame["valid_channel_count"] = pd.to_numeric(frame["valid_channel_count"], errors="coerce").fillna(0)
+        frame["suspected_alignment_channel_count"] = pd.to_numeric(frame["suspected_alignment_channel_count"], errors="coerce").fillna(0)
+        frame["overall_alignment_suspicion_score"] = pd.to_numeric(frame["overall_alignment_suspicion_score"], errors="coerce")
+        periodic_component = (frame["overall_periodic_snr"].clip(0, 0.6) / 0.6 * 35).fillna(0)
+        coherence_component = (frame["overall_template_coherence"].clip(0, 0.6) / 0.6 * 35).fillna(0)
+        channel_count_component = (frame["valid_channel_count"].clip(0, 3) / 3 * 30).fillna(0)
+        alignment_penalty = (frame["suspected_alignment_channel_count"].clip(0, 3) * 12).fillna(0)
+        channel_quality_score = (periodic_component + coherence_component + channel_count_component - alignment_penalty).map(lambda value: clamp(float(value)))
+        signal_quality = (signal_quality * 0.45 + channel_quality_score * 0.55).map(lambda value: clamp(float(value)))
+    else:
+        channel_quality_score = pd.Series([pd.NA] * len(frame), index=frame.index)
     drift_index = (frame["baseline_instability"].clip(0, 1) * 70 + (100 - stability_component) * 0.3).map(lambda value: clamp(float(value)))
     stable_segment_ratio = (stability_component / 100 - frame["baseline_instability"].clip(0, 1) * 0.25).clip(0, 1)
     inferred_duration = frame["duration_seconds"].where(frame["duration_seconds"] > 0)
@@ -187,8 +505,33 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
 
     labels = []
     reasons = []
-    for quality, duration, ratio, duration_available in zip(signal_quality, best_duration, stable_segment_ratio, has_duration):
-        if duration_available and quality >= 75 and duration >= 20 and ratio >= 0.5:
+    validity_iter = zip(
+        signal_quality,
+        best_duration,
+        stable_segment_ratio,
+        has_duration,
+        frame["valid_channel_count"] if has_channel_quality else [None] * len(frame),
+        frame["suspected_alignment_channel_count"] if has_channel_quality else [None] * len(frame),
+        channel_quality_score if has_channel_quality else [None] * len(frame),
+    )
+    for quality, duration, ratio, duration_available, valid_channels, suspected_alignment, channel_score in validity_iter:
+        valid_channels = safe_float(valid_channels)
+        suspected_alignment = safe_float(suspected_alignment) or 0.0
+        channel_score = safe_float(channel_score)
+        if channel_score is not None:
+            if duration_available and duration >= 20 and valid_channels is not None and valid_channels >= 2 and channel_score >= 50 and suspected_alignment <= 1:
+                labels.append("valid")
+                reasons.append("")
+            elif valid_channels is not None and valid_channels >= 1 and channel_score >= 35:
+                labels.append("partial_valid")
+                reasons.append("channel periodic signal is usable but not enough for full validity")
+            elif valid_channels is not None and valid_channels == 0 and suspected_alignment > 0:
+                labels.append("invalid")
+                reasons.append("no valid periodic channel; suspected misalignment or contact issue")
+            else:
+                labels.append("invalid")
+                reasons.append("insufficient periodic pulse signal")
+        elif duration_available and quality >= 75 and duration >= 20 and ratio >= 0.5:
             labels.append("valid")
             reasons.append("")
         elif duration_available and quality >= 60 and duration >= 10:
@@ -219,6 +562,15 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
             "baseline_drift_slope": frame["baseline_drift_slope"].fillna(0).round(6),
             "artifact_ratio": frame["artifact_ratio_from_preview"].round(3),
             "stable_segment_ratio": stable_segment_ratio.round(3),
+            "channel_quality_score": channel_quality_score.round(3),
+            "valid_channel_count": frame.get("valid_channel_count"),
+            "low_snr_channel_count": frame.get("low_snr_channel_count"),
+            "suspected_alignment_channel_count": frame.get("suspected_alignment_channel_count"),
+            "overall_periodic_snr": frame.get("overall_periodic_snr"),
+            "overall_pulse_energy": frame.get("overall_pulse_energy"),
+            "overall_template_coherence": frame.get("overall_template_coherence"),
+            "overall_alignment_suspicion_score": frame.get("overall_alignment_suspicion_score"),
+            "channel_balance_index": frame.get("channel_balance_index"),
             "inferred_duration_seconds": inferred_duration.round(3),
             "duration_available": has_duration,
             "best_segment_start_time": best_start.round(3),
@@ -384,6 +736,9 @@ def write_outputs(output_dir: Path, frames: dict[str, pd.DataFrame], summary: di
 
 def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> str:
     quality = frames.get("measurement_quality", pd.DataFrame())
+    channel_quality = frames.get("channel_signal_quality", pd.DataFrame())
+    measurement_channels = frames.get("measurement_channel_summary", pd.DataFrame())
+    longitudinal_channels = frames.get("longitudinal_channel_summary", pd.DataFrame())
     reliability = frames.get("feature_reliability", pd.DataFrame())
     device = frames.get("device_consistency", pd.DataFrame())
     lines = [
@@ -399,6 +754,9 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         f"- partial valid measurements: {summary['partial_valid_measurement_count']}",
         f"- invalid measurements: {summary['invalid_measurement_count']}",
         f"- duration unavailable measurements: {summary['duration_unavailable_measurement_count']}",
+        f"- waveform channel rows: {summary['channel_signal_count']}",
+        f"- valid channel rows: {summary['valid_channel_signal_count']}",
+        f"- suspected misalignment channel rows: {summary['suspected_misalignment_channel_count']}",
         "",
         "## Feature Reliability",
         "",
@@ -418,6 +776,26 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         lines.append(f"- average drift severity index: {avg_drift:.2f}")
         if summary["duration_unavailable_measurement_count"]:
             lines.append("- duration is unavailable for some measurements; these rows cannot be promoted from `partial_valid` to `valid`.")
+    lines.extend(["", "## Channel Periodic Signal Quality", ""])
+    if channel_quality.empty:
+        lines.append("No channel waveform preview rows were produced.")
+    else:
+        label_counts = channel_quality["channel_validity_label"].value_counts().to_dict()
+        for label in ["valid", "low_snr", "suspected_misalignment", "insufficient_preview"]:
+            if label in label_counts:
+                lines.append(f"- {label}: {label_counts[label]}")
+        avg_snr = channel_quality["periodic_snr"].mean()
+        avg_coherence = channel_quality["template_coherence"].mean()
+        lines.append(f"- average periodic_snr: {avg_snr:.4f}")
+        lines.append(f"- average template_coherence: {avg_coherence:.4f}")
+        lines.append("- metrics are computed from waveform preview points in the current dataset; full-waveform exports should replace this estimator in later phases.")
+    if not measurement_channels.empty:
+        avg_balance = measurement_channels["channel_balance_index"].mean()
+        lines.append(f"- measurement channel summaries: {len(measurement_channels)}")
+        if not math.isnan(avg_balance):
+            lines.append(f"- average channel_balance_index: {avg_balance:.4f}")
+    if not longitudinal_channels.empty:
+        lines.append(f"- longitudinal user-channel summaries: {len(longitudinal_channels)}")
     lines.extend(["", "## Device Consistency", ""])
     if device.empty:
         lines.append(f"No cross-device feature pairs were produced within {summary['near_time_pair_window_minutes']} minutes.")
@@ -430,7 +808,10 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
 def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
     feature_matrix = load_feature_matrix(dataset_dir)
     waveform_frame = waveform_metrics(dataset_dir)
-    quality = analyze_measurement_quality(feature_matrix, waveform_frame)
+    channel_quality = analyze_channel_signal_quality(dataset_dir, feature_matrix)
+    measurement_channels = summarize_measurement_channels(channel_quality)
+    longitudinal_channels = summarize_longitudinal_channels(channel_quality)
+    quality = analyze_measurement_quality(feature_matrix, waveform_frame, measurement_channels)
     reliability = analyze_feature_reliability(feature_matrix, quality)
     device = analyze_device_consistency(feature_matrix, quality, near_minutes)
     summary = {
@@ -442,6 +823,13 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         "partial_valid_measurement_count": int((quality["measurement_validity_label"] == "partial_valid").sum()) if not quality.empty else 0,
         "invalid_measurement_count": int((quality["measurement_validity_label"] == "invalid").sum()) if not quality.empty else 0,
         "duration_unavailable_measurement_count": int((quality["duration_available"] == False).sum()) if not quality.empty and "duration_available" in quality else 0,
+        "channel_signal_count": int(len(channel_quality)),
+        "valid_channel_signal_count": int((channel_quality["channel_validity_label"] == "valid").sum()) if not channel_quality.empty else 0,
+        "low_snr_channel_count": int((channel_quality["channel_validity_label"] == "low_snr").sum()) if not channel_quality.empty else 0,
+        "suspected_misalignment_channel_count": int((channel_quality["channel_validity_label"] == "suspected_misalignment").sum()) if not channel_quality.empty else 0,
+        "insufficient_preview_channel_count": int((channel_quality["channel_validity_label"] == "insufficient_preview").sum()) if not channel_quality.empty else 0,
+        "measurement_channel_summary_count": int(len(measurement_channels)),
+        "longitudinal_channel_summary_count": int(len(longitudinal_channels)),
         "feature_count": int(len(reliability)),
         "device_consistency_feature_count": int(len(device)),
         "device_consistency_pair_count": int(device["pair_count"].sum()) if not device.empty and "pair_count" in device else 0,
@@ -451,6 +839,9 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         output_dir,
         {
             "measurement_quality": quality,
+            "channel_signal_quality": channel_quality,
+            "measurement_channel_summary": measurement_channels,
+            "longitudinal_channel_summary": longitudinal_channels,
             "feature_reliability": reliability,
             "device_consistency": device,
         },
