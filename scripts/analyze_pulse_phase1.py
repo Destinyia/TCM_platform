@@ -168,7 +168,7 @@ def analyze_measurement_quality(feature_matrix: pd.DataFrame, waveform_frame: pd
     frame["waveform_sampling_rate"] = pd.to_numeric(frame.get("waveform_sampling_rate"), errors="coerce")
     frame["baseline_instability"] = pd.to_numeric(frame["baseline_instability"], errors="coerce").fillna(1.0)
     frame["artifact_ratio_from_preview"] = pd.to_numeric(frame["artifact_ratio_from_preview"], errors="coerce").fillna(1.0)
-    frame["has_waveform_preview"] = frame["has_waveform_preview"].fillna(False)
+    frame["has_waveform_preview"] = frame["has_waveform_preview"].map(lambda value: False if pd.isna(value) else bool(value))
 
     stability_component = frame["stability_score"].fillna(50).clip(0, 100)
     drift_penalty = (frame["baseline_instability"].clip(0, 1) * 35).fillna(35)

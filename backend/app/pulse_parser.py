@@ -14,6 +14,7 @@ from backend.app.models import FileAsset, Visit
 PULSE_RECORD_VERSION = "pulse_record_v1"
 WAVEFORM_KEYS = ("SinglePluse", "CunShang", "Cun", "GuanMai", "Chi", "ChiXia")
 DISPLAY_WAVEFORM_KEYS = ("SinglePluse", "Cun", "GuanMai", "Chi")
+YUSHENGTANG_DEFAULT_SAMPLING_RATE = 500.0
 
 
 def to_number(value: Any) -> float | int | None:
@@ -134,13 +135,21 @@ def yushengtang_record(asset: dict[str, Any], fields: dict[str, Any], visit: Vis
     parsed_fields = parse_fields(fields)
     waveform_summary = OrderedDict()
     waveform_preview = []
+    waveform_sample_counts = []
     for key in WAVEFORM_KEYS:
         values = parse_list(parsed_fields.get(key))
         if not values:
             continue
         waveform_summary[key] = waveform_stats(values)
+        waveform_summary[key]["sampling_rate"] = YUSHENGTANG_DEFAULT_SAMPLING_RATE
+        waveform_summary[key]["duration_seconds"] = round(waveform_summary[key]["count"] / YUSHENGTANG_DEFAULT_SAMPLING_RATE, 3)
+        waveform_sample_counts.append(waveform_summary[key]["count"])
         if key in DISPLAY_WAVEFORM_KEYS:
             waveform_preview.append({"name": key, "points": downsample(values)})
+
+    duration_seconds = None
+    if waveform_sample_counts:
+        duration_seconds = round(max(waveform_sample_counts) / YUSHENGTANG_DEFAULT_SAMPLING_RATE, 3)
 
     valid_flags = parse_list(parsed_fields.get("IsValidPulse"))
     valid_count = sum(1 for item in valid_flags if bool(item))
@@ -156,6 +165,10 @@ def yushengtang_record(asset: dict[str, Any], fields: dict[str, Any], visit: Vis
         "source_asset_id": asset.get("asset_id"),
         "source_vendor": "yushengtang",
         "source_format": "json",
+        "sampling_rate": YUSHENGTANG_DEFAULT_SAMPLING_RATE,
+        "sampling_rate_source": "vendor_default_yushengtang_500hz",
+        "duration_seconds": duration_seconds,
+        "duration_source": "waveform_sample_count/sampling_rate",
         "side": normalize_side(parsed_fields.get("LeftOrRight")),
         "position": "\u5173",
         "pulse_type": parsed_fields.get("PulseTypeName") or str(parsed_fields.get("PulseType") or ""),

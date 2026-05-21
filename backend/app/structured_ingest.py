@@ -15,6 +15,7 @@ from backend.app.structured_parser import build_structured_modalities
 
 MODALITIES = ["ask", "pulse", "tongue", "face", "voice", "report"]
 PULSE_QUALITY_FEATURES = {"stability_score", "valid_segment_count", "segment_count"}
+PULSE_METADATA_NUMERIC_FIELDS = {"duration_seconds", "sampling_rate"}
 
 
 def _bool_value(value: Any, default: bool = False) -> bool:
@@ -69,11 +70,23 @@ def _deterministic_uuid(namespace: str) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, namespace)
 
 
+def _scalars(session: Session, stmt):
+    if hasattr(session, "scalars"):
+        return session.scalars(stmt).all()
+    return session.execute(stmt).scalars().all()
+
+
+def _scalar(session: Session, stmt):
+    if hasattr(session, "scalar"):
+        return session.scalar(stmt)
+    return session.execute(stmt).scalar()
+
+
 def _numeric_items(record: dict[str, Any]) -> dict[str, float | int]:
     return {
         key: value
         for key, value in record.items()
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and key not in PULSE_METADATA_NUMERIC_FIELDS
     }
 
 
@@ -147,7 +160,7 @@ def _pulse_analysis_tables_available(session: Session) -> bool:
         "fact_pulse_position_feature",
     ]
     for table_name in required:
-        if session.scalar(select(func.to_regclass(table_name))) is None:
+        if _scalar(session, select(func.to_regclass(table_name))) is None:
             return False
     return True
 
@@ -169,7 +182,7 @@ def _sync_waveform_asset(session: Session, measurement_id: uuid.UUID, record: di
                 points = item.get("points")
                 sample_count = len(points) if isinstance(points, list) else None
             summary = waveform_summary.get(channel_name) if isinstance(waveform_summary, dict) else None
-            if sample_count is None and isinstance(summary, dict):
+            if isinstance(summary, dict) and summary.get("count"):
                 sample_count = summary.get("count")
             waveform_id = _deterministic_uuid(f"pulse-waveform:{measurement_id}:{channel_name}:{index}")
             session.execute(
@@ -255,13 +268,14 @@ def sync_pulse_analysis_tables(session: Session, visits: list[Visit]) -> dict[st
         return result
     try:
         for visit in visits:
-            pulse_records = session.scalars(
+            pulse_records = _scalars(
+                session,
                 select(ModalityRecord).where(
                     ModalityRecord.visit_id == visit.visit_id,
                     ModalityRecord.modality_type == "pulse",
                     ModalityRecord.exists_flag.is_(True),
-                )
-            ).all()
+                ),
+            )
             for modality_record in pulse_records:
                 payload = modality_record.parsed_structured_data_json or {}
                 for index, record in enumerate(payload.get("records") or [], start=1):
@@ -358,7 +372,7 @@ def _visit_query(payload: dict[str, Any]):
 def parse_structured_data(session: Session, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     only_missing = _bool_value(payload.get("only_missing"), default=False)
-    visits = session.scalars(_visit_query(payload)).all()
+    visits = _scalars(session, _visit_query(payload))
 
     result = {
         "visits_scanned": len(visits),
@@ -378,15 +392,16 @@ def parse_structured_data(session: Session, payload: dict[str, Any] | None = Non
     }
 
     for visit in visits:
-        modality_records = session.scalars(
-            select(ModalityRecord).where(ModalityRecord.visit_id == visit.visit_id)
-        ).all()
+        modality_records = _scalars(
+            session,
+            select(ModalityRecord).where(ModalityRecord.visit_id == visit.visit_id),
+        )
         if only_missing:
             modality_records = [item for item in modality_records if not item.parsed_structured_data_json]
         if not modality_records:
             continue
 
-        assets = session.scalars(select(FileAsset).where(FileAsset.visit_id == visit.visit_id)).all()
+        assets = _scalars(session, select(FileAsset).where(FileAsset.visit_id == visit.visit_id))
         modality_by_record_id = {
             item.modality_record_id: item.modality_type
             for item in modality_records

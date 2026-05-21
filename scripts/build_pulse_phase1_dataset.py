@@ -32,6 +32,7 @@ from backend.app.models import (
 DEFAULT_DATASET_ID = "DS-PULSE-PHASE1"
 DEFAULT_VERSION = "v2026.05.phase1.001"
 QUALITY_FEATURE_NAMES = {"stability_score", "signal_quality_score", "artifact_ratio"}
+YUSHENGTANG_DEFAULT_SAMPLING_RATE = 500.0
 
 
 def json_default(value: Any) -> Any:
@@ -40,6 +41,80 @@ def json_default(value: Any) -> Any:
     if hasattr(value, "as_tuple"):
         return float(value)
     return str(value)
+
+
+def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def waveform_summary_count(summary: Any) -> int | None:
+    if not isinstance(summary, dict):
+        return None
+    count = safe_float(summary.get("count"))
+    return int(count) if count and count > 0 else None
+
+
+def normalize_waveform_sample_count(sample_count: Any, summary: Any) -> int | None:
+    current = safe_float(sample_count)
+    summary_count = waveform_summary_count(summary)
+    if summary_count and (current is None or summary_count > current):
+        return summary_count
+    return int(current) if current and current > 0 else None
+
+
+def infer_sampling_rate(source_vendor: str | None, current_rate: Any, waveforms: list[dict[str, Any]]) -> float | None:
+    current = safe_float(current_rate)
+    if current and current > 0:
+        return current
+    rates = [safe_float(row.get("sampling_rate")) for row in waveforms]
+    rates = [rate for rate in rates if rate and rate > 0]
+    if rates:
+        return max(rates)
+    if source_vendor == "yushengtang" and waveforms:
+        return YUSHENGTANG_DEFAULT_SAMPLING_RATE
+    return None
+
+
+def infer_duration_seconds(current_duration: Any, sampling_rate: Any, waveforms: list[dict[str, Any]]) -> float | None:
+    current = safe_float(current_duration)
+    if current and current > 0:
+        return round(current, 3)
+    rate = safe_float(sampling_rate)
+    if not rate or rate <= 0:
+        return None
+    sample_counts = [
+        normalize_waveform_sample_count(row.get("sample_count"), row.get("summary_json"))
+        for row in waveforms
+    ]
+    sample_counts = [count for count in sample_counts if count and count > 0]
+    if not sample_counts:
+        return None
+    return round(max(sample_counts) / rate, 3)
+
+
+def supplement_measurement_timing(measurements: list[dict[str, Any]], waveforms: list[dict[str, Any]]) -> None:
+    waveforms_by_measurement: dict[str, list[dict[str, Any]]] = {}
+    vendor_by_measurement = {row["measurement_id"]: row.get("source_vendor") for row in measurements}
+    for row in waveforms:
+        measurement_id = row["measurement_id"]
+        row["sample_count"] = normalize_waveform_sample_count(row.get("sample_count"), row.get("summary_json"))
+        if not safe_float(row.get("sampling_rate")) and vendor_by_measurement.get(measurement_id) == "yushengtang":
+            row["sampling_rate"] = YUSHENGTANG_DEFAULT_SAMPLING_RATE
+        waveforms_by_measurement.setdefault(measurement_id, []).append(row)
+
+    for row in measurements:
+        measurement_waveforms = waveforms_by_measurement.get(row["measurement_id"], [])
+        sampling_rate = infer_sampling_rate(row.get("source_vendor"), row.get("sampling_rate"), measurement_waveforms)
+        if sampling_rate:
+            row["sampling_rate"] = sampling_rate
+        duration = infer_duration_seconds(row.get("duration_seconds"), sampling_rate, measurement_waveforms)
+        if duration:
+            row["duration_seconds"] = duration
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -199,6 +274,7 @@ def load_measurements() -> tuple[list[dict[str, Any]], list[dict[str, Any]], lis
         }
         for item in variable_rows
     ]
+    supplement_measurement_timing(measurements, waveforms)
     return measurements, features, waveforms, position_features, variables
 
 
@@ -269,23 +345,51 @@ def load_measurements_from_records(session) -> tuple[list[dict[str, Any]], list[
             preview = record.get("waveform_preview") or []
             summary = record.get("waveform_summary") or {}
             if preview or summary:
-                waveforms.append(
-                    {
-                        "waveform_asset_id": f"{measurement_id}:preview",
-                        "measurement_id": measurement_id,
-                        "asset_id": None,
-                        "channel_name": "waveform_preview",
-                        "hand_side": hand_side,
-                        "pulse_position": record.get("pulse_position") or "overall",
-                        "sample_count": summary.get("sample_count") if isinstance(summary, dict) else None,
-                        "sampling_rate": record.get("sampling_rate"),
-                        "storage_uri": None,
-                        "data_format": "json_preview",
-                        "file_hash": None,
-                        "preview_json": preview,
-                        "summary_json": summary,
-                    }
-                )
+                if isinstance(preview, list) and preview:
+                    for preview_index, item in enumerate(preview, start=1):
+                        channel_name = "waveform_preview"
+                        preview_json = item
+                        if isinstance(item, dict):
+                            channel_name = str(item.get("name") or channel_name)
+                        channel_summary = summary.get(channel_name) if isinstance(summary, dict) else {}
+                        waveforms.append(
+                            {
+                                "waveform_asset_id": f"{measurement_id}:preview:{preview_index}",
+                                "measurement_id": measurement_id,
+                                "asset_id": None,
+                                "channel_name": channel_name,
+                                "hand_side": hand_side,
+                                "pulse_position": record.get("pulse_position") or "overall",
+                                "sample_count": normalize_waveform_sample_count(None, channel_summary),
+                                "sampling_rate": record.get("sampling_rate") or (YUSHENGTANG_DEFAULT_SAMPLING_RATE if visit.source_vendor == "yushengtang" else None),
+                                "storage_uri": None,
+                                "data_format": "json_preview",
+                                "file_hash": None,
+                                "preview_json": preview_json,
+                                "summary_json": channel_summary if isinstance(channel_summary, dict) else {},
+                            }
+                        )
+                elif isinstance(summary, dict):
+                    for channel_name, channel_summary in summary.items():
+                        if not isinstance(channel_summary, dict):
+                            continue
+                        waveforms.append(
+                            {
+                                "waveform_asset_id": f"{measurement_id}:summary:{channel_name}",
+                                "measurement_id": measurement_id,
+                                "asset_id": None,
+                                "channel_name": str(channel_name),
+                                "hand_side": hand_side,
+                                "pulse_position": record.get("pulse_position") or "overall",
+                                "sample_count": normalize_waveform_sample_count(None, channel_summary),
+                                "sampling_rate": record.get("sampling_rate") or (YUSHENGTANG_DEFAULT_SAMPLING_RATE if visit.source_vendor == "yushengtang" else None),
+                                "storage_uri": None,
+                                "data_format": "summary_only",
+                                "file_hash": None,
+                                "preview_json": [],
+                                "summary_json": channel_summary,
+                            }
+                        )
 
             for measurement_item in record.get("measurements") or []:
                 if not isinstance(measurement_item, dict):
@@ -329,6 +433,7 @@ def load_measurements_from_records(session) -> tuple[list[dict[str, Any]], list[
         }
         for name in sorted(observed_features)
     ]
+    supplement_measurement_timing(measurements, waveforms)
     return measurements, features, waveforms, position_features, variables
 
 
