@@ -124,7 +124,7 @@
             </template>
             <div class="record-list">
               <button
-                v-for="record in filteredPatientRecords"
+                v-for="record in pagedPatientRecords"
                 :key="record.row_key"
                 type="button"
                 class="record-row"
@@ -143,6 +143,14 @@
                 </span>
               </button>
             </div>
+            <el-pagination
+              v-model:current-page="recordPage"
+              :page-size="recordPageSize"
+              :total="filteredPatientRecords.length"
+              small
+              layout="prev, pager, next"
+              class="record-pagination"
+            />
           </el-card>
         </el-col>
 
@@ -221,6 +229,8 @@ const patientKeyword = ref('')
 const patientPage = ref(1)
 const patientPageSize = 12
 const recordFilter = ref('all')
+const recordPage = ref(1)
+const recordPageSize = 12
 
 const patientTrendChartRef = ref(null)
 const patientSlotChartRef = ref(null)
@@ -304,6 +314,11 @@ const filteredPatientRecords = computed(() => {
     if (recordFilter.value === 'invalid') return !record.included
     return true
   }).reverse()
+})
+
+const pagedPatientRecords = computed(() => {
+  const start = (recordPage.value - 1) * recordPageSize
+  return filteredPatientRecords.value.slice(start, start + recordPageSize)
 })
 
 const patientMetricCards = computed(() => {
@@ -414,6 +429,7 @@ function selectPatient(userId) {
 function openPulseDetail() {
   disposeDetailCharts()
   viewMode.value = 'detail'
+  recordPage.value = 1
   selectedRecord.value = filteredPatientRecords.value[0] || selectedPatientRecords.value.at(-1) || null
   nextTick(renderDetailCharts)
 }
@@ -688,6 +704,7 @@ onMounted(async () => {
 })
 
 watch([selectedUserId, pulseRecords], async () => {
+  recordPage.value = 1
   selectedRecord.value = selectedPatientRecords.value.at(-1) || null
   await nextTick()
   renderPatientCharts()
@@ -695,6 +712,7 @@ watch([selectedUserId, pulseRecords], async () => {
 })
 
 watch([recordFilter, viewMode], async () => {
+  recordPage.value = 1
   if (viewMode.value === 'detail' && !filteredPatientRecords.value.some((record) => record.row_key === selectedRecord.value?.row_key)) {
     selectedRecord.value = filteredPatientRecords.value[0] || null
   }
@@ -816,10 +834,7 @@ onUnmounted(() => {
 }
 
 .record-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 4px;
+  flex: 0 0 auto;
 }
 
 .patient-row,
@@ -869,7 +884,8 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
-.patient-pagination {
+.patient-pagination,
+.record-pagination {
   justify-content: center;
   margin-top: 12px;
 }
@@ -971,8 +987,5 @@ onUnmounted(() => {
     overflow: visible;
   }
 
-  .record-list {
-    max-height: 420px;
-  }
 }
 </style>
