@@ -68,6 +68,34 @@
                 </div>
               </div>
 
+              <div v-if="patientVisualizationLoading || patientVisualization?.available" class="patient-visualization-panel">
+                <div class="visualization-header">
+                  <div>
+                    <strong>单用户脉诊可视化</strong>
+                    <span v-if="patientVisualization?.selected_measurement_start_time">
+                      示例记录 {{ patientVisualization.selected_measurement_start_time }}
+                    </span>
+                  </div>
+                  <el-tag v-if="patientVisualization?.patient_periodic_rows !== undefined" size="small" type="success">
+                    周期通道 {{ patientVisualization.patient_periodic_rows }}
+                  </el-tag>
+                </div>
+                <el-skeleton v-if="patientVisualizationLoading" animated :rows="5" />
+                <template v-else>
+                  <img
+                    v-if="patientVisualizationImageUrl"
+                    :src="patientVisualizationImageUrl"
+                    alt="单用户脉诊可视化"
+                    class="patient-visualization-image"
+                  />
+                  <div class="visualization-meta">
+                    <span>{{ patientVisualization.patient_measurements }} 条记录</span>
+                    <span>{{ patientVisualization.patient_channel_rows }} 条通道样本</span>
+                    <span>平均 SNR {{ formatNumber(patientVisualization.patient_avg_periodic_snr, 3) }}</span>
+                  </div>
+                </template>
+              </div>
+
               <el-row :gutter="16" class="chart-row">
                 <el-col :xs="24" :lg="14">
                   <div ref="patientTrendChartRef" class="chart"></div>
@@ -216,13 +244,15 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
-import { api } from '../services/api'
+import { api, apiUrl } from '../services/api'
 
 const router = useRouter()
 const viewMode = ref('patients')
 const loading = ref(false)
 const users = ref([])
 const pulseRecords = ref([])
+const patientVisualization = ref(null)
+const patientVisualizationLoading = ref(false)
 const selectedUserId = ref('')
 const selectedRecord = ref(null)
 const patientKeyword = ref('')
@@ -298,6 +328,11 @@ const pagedPatients = computed(() => {
 })
 
 const selectedPatient = computed(() => patientSummaries.value.find((patient) => patient.user_id === selectedUserId.value))
+
+const patientVisualizationImageUrl = computed(() => {
+  if (!patientVisualization.value?.available || !patientVisualization.value?.image_url) return ''
+  return apiUrl(patientVisualization.value.image_url)
+})
 
 const selectedPatientRecords = computed(() => {
   return normalizedRecords.value
@@ -417,9 +452,33 @@ function disposeDetailCharts() {
   signalQualityChart = null
 }
 
+async function fetchPatientVisualization() {
+  const userId = selectedUserId.value
+  if (!userId) {
+    patientVisualization.value = null
+    return
+  }
+  patientVisualizationLoading.value = true
+  try {
+    const payload = await api.pulseUserVisualization({ user_id: userId })
+    if (selectedUserId.value === userId) {
+      patientVisualization.value = payload?.available ? payload : null
+    }
+  } catch (error) {
+    if (selectedUserId.value === userId) {
+      patientVisualization.value = null
+    }
+  } finally {
+    if (selectedUserId.value === userId) {
+      patientVisualizationLoading.value = false
+    }
+  }
+}
+
 function selectPatient(userId) {
   selectedUserId.value = userId
   selectedRecord.value = selectedPatientRecords.value.at(-1) || null
+  fetchPatientVisualization()
   nextTick(() => {
     renderPatientCharts()
     renderDetailCharts()
@@ -695,6 +754,7 @@ onMounted(async () => {
     pulseRecords.value = pulsePayload
     selectedUserId.value = patientSummaries.value[0]?.user_id || users.value[0]?.user_id || ''
     selectedRecord.value = selectedPatientRecords.value.at(-1) || null
+    await fetchPatientVisualization()
   } finally {
     loading.value = false
   }
@@ -706,6 +766,7 @@ onMounted(async () => {
 watch([selectedUserId, pulseRecords], async () => {
   recordPage.value = 1
   selectedRecord.value = selectedPatientRecords.value.at(-1) || null
+  fetchPatientVisualization()
   await nextTick()
   renderPatientCharts()
   renderDetailCharts()
@@ -929,6 +990,57 @@ onUnmounted(() => {
   display: block;
   font-size: 12px;
   margin-top: 6px;
+}
+
+.patient-visualization-panel {
+  border: 1px solid #e2ecea;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  padding: 12px;
+}
+
+.visualization-header {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.visualization-header div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.visualization-header strong {
+  color: #1f2d3d;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.visualization-header span,
+.visualization-meta {
+  color: #7a858f;
+  font-size: 12px;
+}
+
+.patient-visualization-image {
+  background: #fff;
+  border: 1px solid #eef2f1;
+  border-radius: 4px;
+  display: block;
+  max-height: 520px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.visualization-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
 }
 
 .chart {

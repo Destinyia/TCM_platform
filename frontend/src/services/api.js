@@ -36,7 +36,8 @@ export const api = {
   pulseSlotStability: (params) => fetchJson('/api/demo/pulse/slot-stability', params),
   pulseCrossUser: () => fetchJson('/api/demo/pulse/cross-user'),
   pulseFeatureDrift: (params) => fetchJson('/api/demo/pulse/feature-drift', params),
-  pulsePhase1Summary: () => fetchJson('/api/pulse/analysis/phase1-summary')
+  pulsePhase1Summary: () => fetchJson('/api/pulse/analysis/phase1-summary'),
+  pulseUserVisualization: (params) => fetchJson('/api/pulse/analysis/user-visualization', params)
 }
 
 export function apiUrl(path) {

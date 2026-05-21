@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import select
 
 import pandas as pd
@@ -155,6 +156,26 @@ def _load_phase1_analysis(dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> dict:
     }
 
 
+def _visualization_summary_for_user(user_id: str, dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> tuple[dict | None, Path | None]:
+    visualization_dir = dataset_dir / "analysis" / "phase1" / "visualizations"
+    if not visualization_dir.exists():
+        return None, None
+    for summary_path in visualization_dir.glob("patient_*_pulse_phase2_3_summary.json"):
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(payload.get("selected_user_id")) != str(user_id):
+            continue
+        image_path = Path(payload.get("image_path") or "")
+        if not image_path.is_absolute():
+            image_path = PROJECT_ROOT / image_path
+        if not image_path.exists():
+            return payload, None
+        return payload, image_path
+    return None, None
+
+
 def measurement_payload(measurement: PulseMeasurement, visit: Visit, user: User, device: Device | None) -> dict:
     features = measurement.feature_json or {}
     return {
@@ -196,6 +217,49 @@ def phase1_analysis_summary():
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return jsonify(_load_phase1_analysis(path))
+
+
+@pulse_api.route("/analysis/user-visualization", methods=["GET"])
+def user_visualization_summary():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"available": False, "message": "user_id is required"}), 400
+    dataset_dir = request.args.get("dataset_dir")
+    path = Path(dataset_dir) if dataset_dir else PULSE_PHASE1_DATASET_DIR
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    payload, image_path = _visualization_summary_for_user(user_id, path)
+    if not payload or not image_path:
+        return jsonify(
+            {
+                "available": False,
+                "user_id": user_id,
+                "analysis_dir": str(path / "analysis" / "phase1"),
+                "message": "single-user pulse visualization not found",
+            }
+        )
+    return jsonify(
+        {
+            "available": True,
+            "user_id": user_id,
+            "image_url": f"/api/pulse/analysis/user-visualization/{user_id}/image",
+            "selected_measurement_id": payload.get("selected_measurement_id"),
+            "selected_measurement_start_time": payload.get("selected_measurement_start_time"),
+            "patient_measurements": payload.get("patient_measurements"),
+            "patient_channel_rows": payload.get("patient_channel_rows"),
+            "patient_periodic_rows": payload.get("patient_periodic_rows"),
+            "patient_avg_periodic_snr": payload.get("patient_avg_periodic_snr"),
+            "created_at": payload.get("created_at"),
+        }
+    )
+
+
+@pulse_api.route("/analysis/user-visualization/<user_id>/image", methods=["GET"])
+def user_visualization_image(user_id: str):
+    payload, image_path = _visualization_summary_for_user(user_id)
+    if not payload or not image_path:
+        return jsonify({"message": "single-user pulse visualization not found"}), 404
+    return send_file(image_path, mimetype="image/png")
 
 
 @pulse_api.route("/measurements", methods=["GET"])
