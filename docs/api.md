@@ -262,7 +262,29 @@ Query：
 
 一阶段新增独立蓝图，注册前缀 `/api/pulse`。这些接口用于当前脉诊研究模块的本地验证和样本检查，不是数据平台面向独立研究者的通用下载契约。未来独立研究者应优先通过通用数据集下载接口获取版本化数据包。
 
-### 5.1 `GET /api/pulse/measurements`
+### 5.1 `GET /api/pulse/analysis/phase1-summary`
+
+用途：读取已生成的一阶段分析结果，返回首页可视化面板所需的聚合指标。
+
+当前默认读取：
+
+```text
+storage/datasets/DS-PULSE-PHASE1/v2026.05.phase1.001/analysis/phase1/
+```
+
+核心字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `measurement_count` | 一阶段 measurement 总数 |
+| `valid_count` / `partial_valid_count` / `invalid_count` | 有效性分布 |
+| `duration_unavailable_count` | 缺少真实或可推断时长的 measurement 数 |
+| `source_quality` | 按来源统计的有效性、平均质量分、平均漂移 |
+| `slot_quality` | 按时段统计的有效性、平均质量分、平均漂移 |
+| `feature_risks` | 特征可靠性风险排序，来自 `feature_reliability.csv` |
+| `quality_drift_scatter` | 质量分与漂移指数散点采样 |
+
+### 5.2 `GET /api/pulse/measurements`
 
 用途：查询脉诊 measurement 样本主表。
 
@@ -292,23 +314,23 @@ Query：
 | `quality_status` / `quality_flags` | 质量状态 |
 | `feature_json` | measurement 级特征摘要 |
 
-### 5.2 `GET /api/pulse/measurements/{measurement_id}`
+### 5.3 `GET /api/pulse/measurements/{measurement_id}`
 
 用途：查询单次脉诊 measurement 详情。
 
-### 5.3 `GET /api/pulse/measurements/{measurement_id}/waveforms`
+### 5.4 `GET /api/pulse/measurements/{measurement_id}/waveforms`
 
 用途：查询单次测量的波形资产索引和预览点。
 
 返回字段来自 `fact_pulse_waveform_asset`，包括 `channel_name`、`sample_count`、`sampling_rate`、`storage_uri`、`data_format`、`preview_json`、`summary_json`。
 
-### 5.4 `GET /api/pulse/measurements/{measurement_id}/position-features`
+### 5.5 `GET /api/pulse/measurements/{measurement_id}/position-features`
 
 用途：查询单次测量的部位级特征明细。
 
 返回字段来自 `fact_pulse_position_feature`，包括 `hand_side`、`pulse_position`、`feature_name`、`feature_value`、`source_field`、`parser_version`、`quality_weight`。
 
-### 5.5 `GET /api/pulse/features`
+### 5.6 `GET /api/pulse/features`
 
 用途：查询 measurement 级扁平特征行。
 
@@ -318,7 +340,7 @@ Query：
 | --- | --- |
 | `feature_name` | 可选，按变量名过滤 |
 
-### 5.6 `GET /api/pulse/feature-variables`
+### 5.7 `GET /api/pulse/feature-variables`
 
 用途：查询脉诊变量字典。
 

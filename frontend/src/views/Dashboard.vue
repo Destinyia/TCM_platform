@@ -43,6 +43,41 @@
       </el-col>
     </el-row>
 
+    <el-card shadow="never" class="panel-card pulse-panel" v-loading="pulseLoading">
+      <template #header>
+        <div class="panel-header">
+          <span>脉诊一阶段分析</span>
+          <el-button type="primary" link @click="router.push('/pulse-analysis')">进入工作台</el-button>
+        </div>
+      </template>
+      <div class="pulse-summary-grid">
+        <div class="pulse-metric">
+          <span class="pulse-metric-value">{{ pulseSummary.valid_count || 0 }}</span>
+          <span class="pulse-metric-label">完整有效</span>
+        </div>
+        <div class="pulse-metric">
+          <span class="pulse-metric-value">{{ pulseSummary.partial_valid_count || 0 }}</span>
+          <span class="pulse-metric-label">初筛可用</span>
+        </div>
+        <div class="pulse-metric">
+          <span class="pulse-metric-value">{{ pulseSummary.invalid_count || 0 }}</span>
+          <span class="pulse-metric-label">质量不足</span>
+        </div>
+        <div class="pulse-metric">
+          <span class="pulse-metric-value">{{ pulseSummary.duration_unavailable_count || 0 }}</span>
+          <span class="pulse-metric-label">缺时长</span>
+        </div>
+      </div>
+      <el-row :gutter="16" class="pulse-chart-row">
+        <el-col :xs="24" :lg="12">
+          <div ref="pulseValidityChartRef" class="chart pulse-chart"></div>
+        </el-col>
+        <el-col :xs="24" :lg="12">
+          <div ref="pulseRiskChartRef" class="chart pulse-chart"></div>
+        </el-col>
+      </el-row>
+    </el-card>
+
     <el-row :gutter="16" class="section-row">
       <el-col :xs="24" :lg="14">
         <el-card shadow="never" class="panel-card">
@@ -111,15 +146,25 @@ import { api } from '../services/api'
 const router = useRouter()
 const coverageChartRef = ref(null)
 const qualityChartRef = ref(null)
+const pulseValidityChartRef = ref(null)
+const pulseRiskChartRef = ref(null)
 const loading = ref(false)
+const pulseLoading = ref(false)
 const summary = ref({
   stats: {},
   modality_coverage: [],
   quality_distribution: [],
   recent_visits: []
 })
+const pulseSummary = ref({
+  available: false,
+  source_quality: [],
+  feature_risks: []
+})
 let coverageChart
 let qualityChart
+let pulseValidityChart
+let pulseRiskChart
 
 const recentVisits = computed(() => summary.value.recent_visits || [])
 const statCards = computed(() => [
@@ -180,21 +225,79 @@ function renderQualityChart() {
   }, true)
 }
 
+function renderPulseValidityChart() {
+  if (!pulseValidityChartRef.value) return
+  const rows = pulseSummary.value.source_quality || []
+  const labels = rows.map((item) => sourceName(item.source_vendor))
+  pulseValidityChart = pulseValidityChart || echarts.init(pulseValidityChartRef.value)
+  pulseValidityChart.setOption({
+    title: { text: '来源质量分布', left: 0, top: 0, textStyle: { fontSize: 14, fontWeight: 600 } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { top: 0, right: 0 },
+    grid: { left: 40, right: 16, top: 48, bottom: 34 },
+    xAxis: { type: 'category', data: labels, axisTick: { show: false } },
+    yAxis: { type: 'value', minInterval: 1 },
+    series: [
+      { name: '完整有效', type: 'bar', stack: 'quality', data: rows.map((item) => item.valid_count), itemStyle: { color: '#2f7d79' } },
+      { name: '初筛可用', type: 'bar', stack: 'quality', data: rows.map((item) => item.partial_valid_count), itemStyle: { color: '#d6a13d' } },
+      { name: '质量不足', type: 'bar', stack: 'quality', data: rows.map((item) => item.invalid_count), itemStyle: { color: '#b05a4a' } }
+    ]
+  }, true)
+}
+
+function renderPulseRiskChart() {
+  if (!pulseRiskChartRef.value) return
+  const rows = (pulseSummary.value.feature_risks || []).slice(0, 6).reverse()
+  pulseRiskChart = pulseRiskChart || echarts.init(pulseRiskChartRef.value)
+  pulseRiskChart.setOption({
+    title: { text: '特征可靠性风险', left: 0, top: 0, textStyle: { fontSize: 14, fontWeight: 600 } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 72, right: 18, top: 44, bottom: 24 },
+    xAxis: { type: 'value', max: 50 },
+    yAxis: { type: 'category', data: rows.map((item) => item.feature_name), axisTick: { show: false } },
+    series: [{
+      name: 'risk score',
+      type: 'bar',
+      data: rows.map((item) => item.risk_score),
+      label: { show: true, position: 'right', formatter: ({ value }) => Number(value).toFixed(1) },
+      itemStyle: {
+        color: ({ value }) => (value >= 40 ? '#b05a4a' : value >= 25 ? '#d6a13d' : '#2f7d79'),
+        borderRadius: [0, 4, 4, 0]
+      }
+    }]
+  }, true)
+}
+
 function resizeCharts() {
   coverageChart?.resize()
   qualityChart?.resize()
+  pulseValidityChart?.resize()
+  pulseRiskChart?.resize()
 }
 
 onMounted(async () => {
   loading.value = true
+  pulseLoading.value = true
   try {
-    summary.value = await api.summary()
+    const [summaryResult, pulseResult] = await Promise.allSettled([
+      api.summary(),
+      api.pulsePhase1Summary()
+    ])
+    if (summaryResult.status === 'fulfilled') {
+      summary.value = summaryResult.value
+    }
+    if (pulseResult.status === 'fulfilled') {
+      pulseSummary.value = pulseResult.value
+    }
   } finally {
     loading.value = false
+    pulseLoading.value = false
   }
   await nextTick()
   renderCoverageChart()
   renderQualityChart()
+  renderPulseValidityChart()
+  renderPulseRiskChart()
   window.addEventListener('resize', resizeCharts)
 })
 
@@ -202,6 +305,8 @@ onUnmounted(() => {
   window.removeEventListener('resize', resizeCharts)
   coverageChart?.dispose()
   qualityChart?.dispose()
+  pulseValidityChart?.dispose()
+  pulseRiskChart?.dispose()
 })
 </script>
 
@@ -251,9 +356,49 @@ onUnmounted(() => {
   height: 304px;
   width: 100%;
 }
+.pulse-panel {
+  margin-bottom: 16px;
+}
+.pulse-summary-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+.pulse-metric {
+  background: #f7faf9;
+  border: 1px solid #e2ecea;
+  border-radius: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+.pulse-metric-value {
+  color: #1f4f4c;
+  display: block;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.pulse-metric-label {
+  color: #69757f;
+  display: block;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.pulse-chart-row {
+  row-gap: 12px;
+}
+.pulse-chart {
+  height: 260px;
+}
 .quick-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+@media (max-width: 768px) {
+  .pulse-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>
