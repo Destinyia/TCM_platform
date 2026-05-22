@@ -11,7 +11,14 @@ from sqlalchemy.orm import Session
 
 from backend.app.feature_wide import rebuild_visit_feature_wide
 from backend.app.models import AnalysisRun, Device, FeatureVariable, FileAsset, ModalityRecord, PulseMeasurement, PulseMeasurementQuality, PulsePositionFeature, PulseWaveformAsset, Visit
-from backend.app.pulse_analysis_engine import analyze_preview_signal, classify_channel, standard_channel_name, summarize_measurement_quality
+from backend.app.pulse_analysis_engine import (
+    analyze_preview_signal,
+    analyze_windowed_signal,
+    classify_channel,
+    standard_channel_name,
+    summarize_measurement_quality,
+    summarize_pattern_stability,
+)
 from backend.app.structured_parser import build_structured_modalities
 
 MODALITIES = ["ask", "pulse", "tongue", "face", "voice", "report"]
@@ -278,26 +285,37 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
         .order_by(PulseWaveformAsset.measurement_id, PulseWaveformAsset.channel_name),
     )
     grouped: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    window_grouped: dict[uuid.UUID, list[dict[str, Any]]] = {}
     for waveform in waveforms:
         measurement = measurements.get(waveform.measurement_id)
         if measurement is None:
             continue
-        metrics = analyze_preview_signal(waveform.preview_json, float(measurement.duration_seconds) if measurement.duration_seconds else None)
+        duration_seconds = float(measurement.duration_seconds) if measurement.duration_seconds else None
+        channel = standard_channel_name(waveform.channel_name)
+        metrics = analyze_preview_signal(waveform.preview_json, duration_seconds)
         row = {
             "measurement_id": str(waveform.measurement_id),
             "waveform_asset_id": str(waveform.waveform_asset_id),
             "channel_name": waveform.channel_name,
-            "standard_channel_name": standard_channel_name(waveform.channel_name),
+            "standard_channel_name": channel,
             **{key: value for key, value in metrics.items() if key not in {"values", "template_vector", "normalized_template_vector"}},
         }
         grouped.setdefault(waveform.measurement_id, []).append(row)
+        for window_row in analyze_windowed_signal(waveform.preview_json, duration_seconds, channel):
+            window_grouped.setdefault(waveform.measurement_id, []).append(
+                {
+                    "measurement_id": str(waveform.measurement_id),
+                    "waveform_asset_id": str(waveform.waveform_asset_id),
+                    **window_row,
+                }
+            )
 
     if not grouped:
         return 0
 
     analysis_run = AnalysisRun(
         analysis_type="pulse_online_ingest_analysis",
-        code_version="pulse_analysis_engine_v1",
+        code_version="pulse_analysis_engine_v2",
         parameter_json={"trigger": "parse_structured_data"},
         status="completed",
         result_summary_json={"measurement_count": len(grouped)},
@@ -318,17 +336,25 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
             labelled_rows,
             float(measurements[measurement_id].duration_seconds) if measurements.get(measurement_id) and measurements[measurement_id].duration_seconds else None,
         )
+        pattern_summary = summarize_pattern_stability(window_grouped.get(measurement_id, []))
+        stable_segment_ratio = None
+        if pattern_summary.get("total_window_count"):
+            stable_segment_ratio = pattern_summary.get("valid_window_count", 0) / pattern_summary["total_window_count"]
         session.add(
             PulseMeasurementQuality(
                 analysis_run_id=analysis_run.analysis_run_id,
                 measurement_id=measurement_id,
-                stable_segment_ratio=None,
-                best_segment_quality_score=summary.get("signal_quality_score"),
+                stable_segment_ratio=stable_segment_ratio,
+                best_segment_start_time=pattern_summary.get("best_segment_start_time"),
+                best_segment_end_time=pattern_summary.get("best_segment_end_time"),
+                best_segment_quality_score=pattern_summary.get("best_segment_quality_score") or summary.get("signal_quality_score"),
                 signal_quality_score=summary.get("signal_quality_score"),
                 measurement_validity_label=summary.get("measurement_validity_label"),
                 result_json={
                     **summary,
+                    "pattern_summary": pattern_summary,
                     "channel_rows": labelled_rows,
+                    "window_rows": window_grouped.get(measurement_id, []),
                 },
             )
         )

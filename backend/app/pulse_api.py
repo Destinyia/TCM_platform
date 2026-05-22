@@ -15,9 +15,11 @@ from backend.app.database import SessionLocal, get_engine
 from backend.app.pulse_analysis_engine import (
     CHANNEL_ORDER,
     analyze_preview_signal,
+    analyze_windowed_signal,
     classify_channel,
     standard_channel_name,
     summarize_measurement_quality,
+    summarize_pattern_stability,
 )
 from backend.app.models import (
     Device,
@@ -321,6 +323,27 @@ def user_pulse_analysis_summary():
         for row in core_rows
     ]
     selected_core_rows = [row for row in selected_rows if row["standard_channel_name"] in CHANNEL_ORDER]
+    window_features = []
+    for row in selected_core_rows:
+        for window_row in analyze_windowed_signal(row.get("values") or [], row.get("duration_seconds"), row["standard_channel_name"]):
+            window_features.append(
+                {
+                    "measurement_id": row["measurement_id"],
+                    "start_time": row["start_time"],
+                    "channel": row["standard_channel_name"],
+                    "window_index": window_row.get("window_index"),
+                    "start_offset_seconds": _clean_number(window_row.get("start_offset_seconds"), 3),
+                    "end_offset_seconds": _clean_number(window_row.get("end_offset_seconds"), 3),
+                    "periodic_snr": _clean_number(window_row.get("periodic_snr"), 6),
+                    "template_coherence": _clean_number(window_row.get("template_coherence"), 6),
+                    "residual_fluctuation": _clean_number(window_row.get("residual_fluctuation"), 6),
+                    "quality_score": _clean_number(window_row.get("quality_score"), 3),
+                    "alignment_suspicion_score": _clean_number(window_row.get("alignment_suspicion_score"), 3),
+                    "channel_validity_label": window_row.get("channel_validity_label"),
+                    "periodic_signal_label": window_row.get("periodic_signal_label"),
+                }
+            )
+    pattern_summary = summarize_pattern_stability(window_features)
     return jsonify(
         {
             "available": True,
@@ -332,6 +355,8 @@ def user_pulse_analysis_summary():
             "selected_measurement_id": selected_measurement_id,
             "selected_measurement_start_time": as_json(selected_measurement.start_time) if selected_measurement else None,
             "selected_measurement_quality": measurement_summaries.get(selected_measurement_id),
+            "pattern_summary": pattern_summary,
+            "window_features": window_features,
             "longitudinal": longitudinal,
             "quality_scatter": quality_scatter,
             "waveforms": [

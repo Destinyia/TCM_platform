@@ -300,6 +300,8 @@ Query：
 | `selected_measurement_id` | 可视化中选用的示例 measurement |
 | `patient_measurements` / `patient_channel_rows` / `patient_periodic_rows` | 用户级样本统计 |
 | `patient_avg_periodic_snr` | 用户三通道平均周期信噪比 |
+| `pattern_summary` | 示例 measurement 的阶段四模式稳定性摘要，包含推荐有效片段、稳定性评分、通道漂移和全局接触/体位变化评分 |
+| `window_features` | 示例 measurement 的阶段四窗口级三通道质量轨迹 |
 | `longitudinal` | 通道级纵向周期 SNR 序列 |
 | `quality_scatter` | 能量与疑似未对准评分散点数据 |
 | `waveforms` | 示例 measurement 的三通道预览波形 |

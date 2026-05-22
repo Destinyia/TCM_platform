@@ -375,6 +375,78 @@ def preview_channel_metrics(values: list[float]) -> dict[str, Any]:
     return {key: value for key, value in metrics.items() if key not in {"template_vector", "normalized_template_vector", "residual_vector"}}
 
 
+def classify_channel_metrics(metrics: dict[str, Any], energy_ratio_to_median: float | None = None) -> dict[str, Any]:
+    preview_count = safe_float(metrics.get("preview_point_count")) or 0
+    coherence = safe_float(metrics.get("template_coherence")) or 0.0
+    snr = safe_float(metrics.get("periodic_snr")) or 0.0
+    fluctuation = safe_float(metrics.get("residual_fluctuation")) or 1.0
+    if preview_count < 16:
+        suspicion = 100.0
+        channel_label = "insufficient_preview"
+    else:
+        flat_penalty = clamp(((0.35 - (energy_ratio_to_median or 0.0)) / 0.35) * 45, 0, 45) if energy_ratio_to_median is not None else 20.0
+        periodic_penalty = clamp(((0.18 - coherence) / 0.18) * 35, 0, 35)
+        snr_penalty = clamp(((0.15 - snr) / 0.15) * 20, 0, 20)
+        fluctuation_penalty = clamp((fluctuation - 0.7) * 20, 0, 15)
+        suspicion = flat_penalty + periodic_penalty + snr_penalty + fluctuation_penalty
+        if suspicion >= 60:
+            channel_label = "suspected_misalignment"
+        elif snr < 0.08 or coherence < 0.08:
+            channel_label = "low_snr"
+        else:
+            channel_label = "valid"
+
+    bpm = safe_float(metrics.get("estimated_pulse_rate_bpm"))
+    consistency = safe_float(metrics.get("period_consistency_score")) or 0.0
+    plausible_bpm = bpm is None or 35 <= bpm <= 180
+    if channel_label == "suspected_misalignment":
+        periodic_label = "suspected_misalignment"
+    elif snr >= 0.35 and coherence >= 0.25 and consistency >= 0.25 and plausible_bpm:
+        periodic_label = "clear_periodic"
+    elif snr >= 0.08 and coherence >= 0.08 and plausible_bpm:
+        periodic_label = "weak_periodic"
+    else:
+        periodic_label = "non_periodic_or_noise"
+
+    return {
+        "alignment_suspicion_score": round(suspicion, 3),
+        "channel_validity_label": channel_label,
+        "periodic_signal_label": periodic_label,
+    }
+
+
+def window_preview_segments(point_count: int, dominant_lag: int | None = None) -> list[tuple[int, int]]:
+    if point_count < 32:
+        return []
+    preferred = (dominant_lag or 10) * 4
+    window_size = int(min(point_count, max(32, preferred)))
+    if point_count >= 96:
+        window_size = min(window_size, max(32, point_count // 2))
+    step = max(8, window_size // 2)
+    segments = []
+    start = 0
+    while start + window_size <= point_count:
+        segments.append((start, start + window_size))
+        start += step
+    if segments and segments[-1][1] < point_count:
+        tail = (max(0, point_count - window_size), point_count)
+        if tail != segments[-1]:
+            segments.append(tail)
+    if not segments:
+        segments.append((0, point_count))
+    return segments
+
+
+def window_quality_score(metrics: dict[str, Any], alignment_suspicion_score: float) -> float:
+    return clamp(
+        (safe_float(metrics.get("template_explained_variance_ratio")) or 0.0) * 35
+        + (safe_float(metrics.get("template_coherence")) or 0.0) * 30
+        + min(1.0, safe_float(metrics.get("periodic_snr")) or 0.0) * 25
+        - (safe_float(metrics.get("residual_energy_ratio")) or 1.0) * 15
+        - alignment_suspicion_score * 0.20
+    )
+
+
 def load_feature_matrix(dataset_dir: Path) -> pd.DataFrame:
     measurements = read_table(dataset_dir, "measurements")
     features = read_table(dataset_dir, "measurement_features")
@@ -718,6 +790,159 @@ def analyze_pulse_periodicity(channel_quality: pd.DataFrame) -> pd.DataFrame:
         frame.groupby("measurement_id")["periodic_snr"].rank(method="first", ascending=False, na_option="bottom").astype("Int64")
     )
     return frame
+
+
+def analyze_windowed_pattern_stability(dataset_dir: Path, feature_matrix: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = read_jsonl(dataset_dir / "waveform_manifest.jsonl")
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    metadata = waveform_metadata(feature_matrix)
+    measurement_meta = metadata.set_index("measurement_id").to_dict(orient="index") if not metadata.empty else {}
+    records = []
+    for row in rows:
+        values = extract_preview_values(row)
+        channel = standard_channel_name(row.get("channel_name"))
+        if channel not in {*CHANNEL_ORDER, "overall"}:
+            continue
+        summary = parse_json_value(row.get("summary_json"), {})
+        summary = summary if isinstance(summary, dict) else {}
+        sample_count = safe_float(row.get("sample_count")) or safe_float(summary.get("count"))
+        sampling_rate = safe_float(row.get("sampling_rate")) or safe_float(summary.get("sampling_rate"))
+        duration_seconds = safe_float(row.get("duration_seconds")) or safe_float(summary.get("duration_seconds"))
+        if duration_seconds is None and sample_count and sampling_rate:
+            duration_seconds = sample_count / sampling_rate
+        meta = measurement_meta.get(row.get("measurement_id"), {})
+        if duration_seconds is None:
+            duration_seconds = safe_float(meta.get("duration_seconds"))
+
+        full_metrics = decompose_preview_signal(values, duration_seconds)
+        segments = window_preview_segments(len(values), safe_float(full_metrics.get("dominant_lag_preview_points")))
+        seconds_per_point = preview_seconds_per_point(duration_seconds, len(values))
+        for window_index, (start, end) in enumerate(segments):
+            window_values = values[start:end]
+            window_duration = (end - start - 1) * seconds_per_point if seconds_per_point else None
+            metrics = decompose_preview_signal(window_values, window_duration)
+            compact_metrics = {key: value for key, value in metrics.items() if key not in {"template_vector", "normalized_template_vector", "residual_vector"}}
+            records.append(
+                {
+                    "window_id": f"{row.get('waveform_asset_id') or row.get('measurement_id')}:{window_index}",
+                    "measurement_id": row.get("measurement_id"),
+                    "waveform_asset_id": row.get("waveform_asset_id"),
+                    "user_id": meta.get("user_id"),
+                    "source_vendor": meta.get("source_vendor"),
+                    "device_id": meta.get("device_id"),
+                    "visit_slot": meta.get("visit_slot"),
+                    "start_time": meta.get("start_time"),
+                    "channel_name": row.get("channel_name"),
+                    "standard_channel_name": channel,
+                    "window_index": window_index,
+                    "start_preview_index": start,
+                    "end_preview_index": end - 1,
+                    "start_offset_seconds": round(start * seconds_per_point, 6) if seconds_per_point else None,
+                    "end_offset_seconds": round((end - 1) * seconds_per_point, 6) if seconds_per_point else None,
+                    "duration_seconds": round(window_duration, 6) if window_duration else None,
+                    **compact_metrics,
+                }
+            )
+
+    window_features = pd.DataFrame(records)
+    if window_features.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    window_features["pulse_energy"] = pd.to_numeric(window_features["pulse_energy"], errors="coerce")
+    median_energy = window_features.groupby("standard_channel_name")["pulse_energy"].transform("median")
+    window_features["channel_energy_ratio_to_median"] = window_features["pulse_energy"] / median_energy.where(median_energy > 0)
+
+    labels = []
+    suspicion_scores = []
+    quality_scores = []
+    for _, row in window_features.iterrows():
+        metrics = row.to_dict()
+        label_info = classify_channel_metrics(metrics, safe_float(row.get("channel_energy_ratio_to_median")))
+        suspicion = safe_float(label_info.get("alignment_suspicion_score")) or 0.0
+        labels.append(label_info)
+        suspicion_scores.append(suspicion)
+        quality_scores.append(round(window_quality_score(metrics, suspicion), 3))
+    window_features["alignment_suspicion_score"] = suspicion_scores
+    window_features["quality_score"] = quality_scores
+    window_features["channel_validity_label"] = [label["channel_validity_label"] for label in labels]
+    window_features["periodic_signal_label"] = [label["periodic_signal_label"] for label in labels]
+
+    numeric_columns = window_features.select_dtypes(include=["number"]).columns
+    window_features[numeric_columns] = window_features[numeric_columns].round(6)
+    return window_features, summarize_measurement_pattern_stability(window_features)
+
+
+def summarize_measurement_pattern_stability(window_features: pd.DataFrame) -> pd.DataFrame:
+    if window_features.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for measurement_id, group in window_features.groupby("measurement_id", dropna=False):
+        core = group[group["standard_channel_name"].isin(CHANNEL_ORDER)].copy()
+        usable = core if not core.empty else group.copy()
+        quality = pd.to_numeric(usable["quality_score"], errors="coerce")
+        valid_window_count = int((usable["channel_validity_label"] == "valid").sum())
+        total_window_count = int(len(usable))
+        avg_quality = float(quality.mean()) if quality.notna().any() else 0.0
+        best_quality = float(quality.max()) if quality.notna().any() else 0.0
+
+        per_window_quality = usable.groupby("window_index")["quality_score"].mean()
+        best_window_index = int(per_window_quality.idxmax()) if not per_window_quality.empty else None
+        best_rows = usable[usable["window_index"] == best_window_index] if best_window_index is not None else usable.iloc[0:0]
+        best_start = pd.to_numeric(best_rows["start_offset_seconds"], errors="coerce").min() if not best_rows.empty else None
+        best_end = pd.to_numeric(best_rows["end_offset_seconds"], errors="coerce").max() if not best_rows.empty else None
+
+        channel_spreads = []
+        for _, window_group in usable.groupby("window_index"):
+            channel_quality = pd.to_numeric(window_group["quality_score"], errors="coerce").dropna()
+            if len(channel_quality) >= 2:
+                channel_spreads.append(float(channel_quality.max() - channel_quality.min()))
+        channel_drift = sum(channel_spreads) / len(channel_spreads) if channel_spreads else 0.0
+
+        ordered_window_quality = [float(value) for value in per_window_quality.sort_index().dropna().tolist()]
+        posture_shift = (
+            sum(abs(ordered_window_quality[index] - ordered_window_quality[index - 1]) for index in range(1, len(ordered_window_quality)))
+            / (len(ordered_window_quality) - 1)
+            if len(ordered_window_quality) >= 2
+            else 0.0
+        )
+        valid_fraction = valid_window_count / total_window_count if total_window_count else 0.0
+        pattern_stability = clamp(avg_quality * 0.55 + best_quality * 0.35 + valid_fraction * 10 - channel_drift * 0.4 - posture_shift * 0.4)
+        if total_window_count < 3:
+            label = "insufficient_windows"
+        elif pattern_stability >= 60 and best_quality >= 50 and valid_window_count >= 3:
+            label = "stable_valid"
+        elif best_quality >= 45 and valid_window_count >= 1:
+            label = "local_valid_segment"
+        else:
+            label = "unstable_or_noisy"
+
+        first = usable.iloc[0]
+        rows.append(
+            {
+                "measurement_id": measurement_id,
+                "user_id": first.get("user_id"),
+                "source_vendor": first.get("source_vendor"),
+                "device_id": first.get("device_id"),
+                "visit_slot": first.get("visit_slot"),
+                "start_time": first.get("start_time"),
+                "valid_window_count": valid_window_count,
+                "total_window_count": total_window_count,
+                "avg_window_quality_score": round(avg_quality, 3),
+                "pattern_stability_score": round(pattern_stability, 3),
+                "best_pattern_window_index": best_window_index,
+                "best_segment_start_time": round(float(best_start), 6) if pd.notna(best_start) else None,
+                "best_segment_end_time": round(float(best_end), 6) if pd.notna(best_end) else None,
+                "best_segment_duration": round(float(best_end - best_start), 6) if pd.notna(best_start) and pd.notna(best_end) else None,
+                "best_segment_quality_score": round(best_quality, 3),
+                "channel_specific_drift_score": round(clamp(channel_drift), 3),
+                "global_posture_shift_score": round(clamp(posture_shift), 3),
+                "pattern_validity_label": label,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def waveform_metadata(feature_matrix: pd.DataFrame) -> pd.DataFrame:
@@ -1124,12 +1349,14 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
     pulse_periodicity = frames.get("pulse_periodicity", pd.DataFrame())
     decomposition = frames.get("trend_residual_decomposition", pd.DataFrame())
     templates = frames.get("pulse_templates", pd.DataFrame())
+    window_features = frames.get("window_channel_features", pd.DataFrame())
+    pattern_stability = frames.get("measurement_pattern_stability", pd.DataFrame())
     measurement_channels = frames.get("measurement_channel_summary", pd.DataFrame())
     longitudinal_channels = frames.get("longitudinal_channel_summary", pd.DataFrame())
     reliability = frames.get("feature_reliability", pd.DataFrame())
     device = frames.get("device_consistency", pd.DataFrame())
     lines = [
-        "# Pulse Phase 1-3 Analysis Report",
+        "# Pulse Phase 1-4 Analysis Report",
         "",
         f"Generated at: {summary['created_at']}",
         "",
@@ -1147,6 +1374,8 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
         f"- periodicity rows: {summary['pulse_periodicity_count']}",
         f"- decomposition rows: {summary['trend_residual_decomposition_count']}",
         f"- pulse template rows: {summary['pulse_template_count']}",
+        f"- window channel feature rows: {summary['window_channel_feature_count']}",
+        f"- measurement pattern stability rows: {summary['measurement_pattern_stability_count']}",
         "",
         "## Feature Reliability",
         "",
@@ -1213,6 +1442,25 @@ def render_report(summary: dict[str, Any], frames: dict[str, pd.DataFrame]) -> s
             lines.append(f"- average residual energy ratio: {avg_residual:.4f}")
     if not templates.empty:
         lines.append(f"- pulse templates: {len(templates)}")
+    lines.extend(["", "## Windowed Three-Channel Pattern Stability", ""])
+    if window_features.empty or pattern_stability.empty:
+        lines.append("No windowed pattern stability rows were produced.")
+    else:
+        window_label_counts = window_features["channel_validity_label"].value_counts().to_dict()
+        for label in ["valid", "low_snr", "suspected_misalignment", "insufficient_preview"]:
+            if label in window_label_counts:
+                lines.append(f"- window {label}: {window_label_counts[label]}")
+        pattern_counts = pattern_stability["pattern_validity_label"].value_counts().to_dict()
+        for label in ["stable_valid", "local_valid_segment", "unstable_or_noisy", "insufficient_windows"]:
+            if label in pattern_counts:
+                lines.append(f"- {label}: {pattern_counts[label]}")
+        avg_stability = pattern_stability["pattern_stability_score"].mean()
+        avg_shift = pattern_stability["global_posture_shift_score"].mean()
+        if not math.isnan(avg_stability):
+            lines.append(f"- average pattern_stability_score: {avg_stability:.2f}")
+        if not math.isnan(avg_shift):
+            lines.append(f"- average global_posture_shift_score: {avg_shift:.2f}")
+        lines.append("- current windowing uses waveform preview points; full-waveform ingestion can preserve these outputs while increasing temporal resolution.")
     lines.extend(["", "## Device Consistency", ""])
     if device.empty:
         lines.append(f"No cross-device feature pairs were produced within {summary['near_time_pair_window_minutes']} minutes.")
@@ -1228,6 +1476,7 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
     channel_quality = analyze_channel_signal_quality(dataset_dir, feature_matrix)
     pulse_periodicity = analyze_pulse_periodicity(channel_quality)
     decomposition, templates = analyze_template_decomposition(dataset_dir, feature_matrix)
+    window_features, pattern_stability = analyze_windowed_pattern_stability(dataset_dir, feature_matrix)
     measurement_channels = summarize_measurement_channels(channel_quality)
     longitudinal_channels = summarize_longitudinal_channels(channel_quality)
     quality = analyze_measurement_quality(feature_matrix, waveform_frame, measurement_channels)
@@ -1253,6 +1502,11 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
         "trend_residual_decomposition_count": int(len(decomposition)),
         "usable_template_decomposition_count": int((decomposition["decomposition_quality_label"] == "usable_template").sum()) if not decomposition.empty else 0,
         "pulse_template_count": int(len(templates)),
+        "window_channel_feature_count": int(len(window_features)),
+        "valid_window_channel_feature_count": int((window_features["channel_validity_label"] == "valid").sum()) if not window_features.empty else 0,
+        "measurement_pattern_stability_count": int(len(pattern_stability)),
+        "stable_pattern_measurement_count": int((pattern_stability["pattern_validity_label"] == "stable_valid").sum()) if not pattern_stability.empty else 0,
+        "local_valid_pattern_measurement_count": int((pattern_stability["pattern_validity_label"] == "local_valid_segment").sum()) if not pattern_stability.empty else 0,
         "measurement_channel_summary_count": int(len(measurement_channels)),
         "longitudinal_channel_summary_count": int(len(longitudinal_channels)),
         "feature_count": int(len(reliability)),
@@ -1268,6 +1522,8 @@ def analyze(dataset_dir: Path, output_dir: Path, near_minutes: int) -> None:
             "pulse_periodicity": pulse_periodicity,
             "trend_residual_decomposition": decomposition,
             "pulse_templates": templates,
+            "window_channel_features": window_features,
+            "measurement_pattern_stability": pattern_stability,
             "measurement_channel_summary": measurement_channels,
             "longitudinal_channel_summary": longitudinal_channels,
             "feature_reliability": reliability,

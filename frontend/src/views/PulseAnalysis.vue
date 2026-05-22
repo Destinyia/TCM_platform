@@ -87,6 +87,10 @@
                     <span>{{ patientPulseSummary.patient_measurements }} 条记录</span>
                     <span>{{ patientPulseSummary.patient_channel_rows }} 条通道样本</span>
                     <span>平均 SNR {{ formatNumber(patientPulseSummary.patient_avg_periodic_snr, 3) }}</span>
+                    <span>模式稳定 {{ formatNumber(patientPulseSummary.pattern_summary?.pattern_stability_score, 1) }}</span>
+                    <span v-if="patientPulseSummary.pattern_summary?.best_segment_duration">
+                      推荐片段 {{ formatNumber(patientPulseSummary.pattern_summary.best_segment_start_time, 1) }}s-{{ formatNumber(patientPulseSummary.pattern_summary.best_segment_end_time, 1) }}s
+                    </span>
                   </div>
                 </template>
               </div>
@@ -581,9 +585,9 @@ function renderPatientOnlineAnalysisChart() {
   const dates = [...new Set(longitudinalRows.map((row) => formatDateTimeLabel(row.start_time)))]
   const scatterRows = payload.quality_scatter || []
   const waveforms = payload.waveforms || []
-  const templates = payload.templates || []
+  const windowFeatures = payload.window_features || []
   const maxWaveformLength = Math.max(0, ...waveforms.map((row) => row.points?.length || 0))
-  const maxTemplateLength = Math.max(0, ...templates.map((row) => row.points?.length || 0))
+  const maxWindowIndex = Math.max(0, ...windowFeatures.map((row) => Number(row.window_index) || 0))
   patientOnlineAnalysisChart.setOption({
     tooltip: { trigger: 'axis' },
     legend: { top: 0, right: 0 },
@@ -597,13 +601,13 @@ function renderPatientOnlineAnalysisChart() {
       { text: '纵向周期 SNR', left: 0, top: 12, textStyle: { fontSize: 13, fontWeight: 600 } },
       { text: '能量与疑似未对准', left: '52%', top: 12, textStyle: { fontSize: 13, fontWeight: 600 } },
       { text: '示例记录预览波形', left: 0, top: '52%', textStyle: { fontSize: 13, fontWeight: 600 } },
-      { text: '示例记录归一化模板', left: '52%', top: '52%', textStyle: { fontSize: 13, fontWeight: 600 } }
+      { text: '示例记录窗口质量', left: '52%', top: '52%', textStyle: { fontSize: 13, fontWeight: 600 } }
     ],
     xAxis: [
       { type: 'category', gridIndex: 0, data: dates, axisLabel: { rotate: 25, fontSize: 10 } },
       { type: 'value', gridIndex: 1, name: 'energy' },
       { type: 'category', gridIndex: 2, data: Array.from({ length: maxWaveformLength }, (_, index) => index + 1), axisLabel: { fontSize: 10 } },
-      { type: 'category', gridIndex: 3, data: Array.from({ length: maxTemplateLength }, (_, index) => index + 1), axisLabel: { fontSize: 10 } }
+      { type: 'category', gridIndex: 3, data: Array.from({ length: maxWindowIndex + 1 }, (_, index) => index + 1), axisLabel: { fontSize: 10 } }
     ],
     yAxis: [
       { type: 'value', gridIndex: 0, name: 'SNR' },
@@ -645,14 +649,18 @@ function renderPatientOnlineAnalysisChart() {
         data: row.points || [],
         itemStyle: { color: colors[row.channel] }
       })),
-      ...templates.map((row) => ({
-        name: `${channelNames[row.channel] || row.channel} template`,
+      ...channels.map((channel) => ({
+        name: `${channelNames[channel]} window quality`,
         type: 'line',
         xAxisIndex: 3,
         yAxisIndex: 3,
-        symbolSize: 4,
-        data: row.points || [],
-        itemStyle: { color: colors[row.channel] }
+        smooth: true,
+        symbolSize: 5,
+        data: Array.from({ length: maxWindowIndex + 1 }, (_, index) => {
+          const row = windowFeatures.find((item) => item.channel === channel && Number(item.window_index) === index)
+          return row ? row.quality_score : null
+        }),
+        itemStyle: { color: colors[channel] }
       }))
     ]
   }, true)

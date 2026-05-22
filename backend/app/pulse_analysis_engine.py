@@ -292,6 +292,156 @@ def classify_channel(metrics: dict[str, Any], energy_ratio_to_median: float | No
     }
 
 
+def window_preview_segments(point_count: int, dominant_lag: int | None = None) -> list[tuple[int, int]]:
+    if point_count < 32:
+        return []
+    preferred = (dominant_lag or 10) * 4
+    window_size = int(min(point_count, max(32, preferred)))
+    if point_count >= 96:
+        window_size = min(window_size, max(32, point_count // 2))
+    step = max(8, window_size // 2)
+    segments = []
+    start = 0
+    while start + window_size <= point_count:
+        segments.append((start, start + window_size))
+        start += step
+    if segments and segments[-1][1] < point_count:
+        tail = (max(0, point_count - window_size), point_count)
+        if tail != segments[-1]:
+            segments.append(tail)
+    if not segments:
+        segments.append((0, point_count))
+    return segments
+
+
+def window_quality_score(metrics: dict[str, Any], alignment_suspicion_score: float) -> float:
+    return clamp(
+        (safe_float(metrics.get("template_explained_variance_ratio")) or 0.0) * 35
+        + (safe_float(metrics.get("template_coherence")) or 0.0) * 30
+        + min(1.0, safe_float(metrics.get("periodic_snr")) or 0.0) * 25
+        - (safe_float(metrics.get("residual_energy_ratio")) or 1.0) * 15
+        - alignment_suspicion_score * 0.20
+    )
+
+
+def analyze_windowed_signal(preview: Any, duration_seconds: float | None = None, channel: str | None = None) -> list[dict[str, Any]]:
+    values = extract_preview_values(preview)
+    full_metrics = analyze_preview_signal(values, duration_seconds)
+    dominant_lag = safe_float(full_metrics.get("dominant_lag_preview_points"))
+    seconds_per_point = preview_seconds_per_point(duration_seconds, len(values))
+    rows = []
+    for window_index, (start, end) in enumerate(window_preview_segments(len(values), int(dominant_lag) if dominant_lag else None)):
+        window_values = values[start:end]
+        window_duration = (end - start - 1) * seconds_per_point if seconds_per_point else None
+        metrics = analyze_preview_signal(window_values, window_duration)
+        labels = classify_channel(metrics)
+        suspicion = safe_float(labels.get("alignment_suspicion_score")) or 0.0
+        rows.append(
+            {
+                "channel": channel,
+                "window_index": window_index,
+                "start_preview_index": start,
+                "end_preview_index": end - 1,
+                "start_offset_seconds": round(start * seconds_per_point, 6) if seconds_per_point else None,
+                "end_offset_seconds": round((end - 1) * seconds_per_point, 6) if seconds_per_point else None,
+                "duration_seconds": round(window_duration, 6) if window_duration else None,
+                "preview_point_count": metrics.get("preview_point_count"),
+                "periodic_snr": metrics.get("periodic_snr"),
+                "pulse_energy": metrics.get("pulse_energy"),
+                "template_coherence": metrics.get("template_coherence"),
+                "template_explained_variance_ratio": metrics.get("template_explained_variance_ratio"),
+                "residual_fluctuation": metrics.get("residual_fluctuation"),
+                "residual_energy_ratio": metrics.get("residual_energy_ratio"),
+                "dfa_alpha": metrics.get("dfa_alpha"),
+                "alignment_suspicion_score": suspicion,
+                "quality_score": round(window_quality_score(metrics, suspicion), 3),
+                "channel_validity_label": labels.get("channel_validity_label"),
+                "periodic_signal_label": labels.get("periodic_signal_label"),
+            }
+        )
+    return rows
+
+
+def summarize_pattern_stability(window_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [row for row in window_rows if row.get("channel") in CHANNEL_ORDER] or window_rows
+    total_window_count = len(usable)
+    if not total_window_count:
+        return {
+            "valid_window_count": 0,
+            "total_window_count": 0,
+            "avg_window_quality_score": 0.0,
+            "pattern_stability_score": 0.0,
+            "pattern_validity_label": "insufficient_windows",
+        }
+
+    qualities = [safe_float(row.get("quality_score")) for row in usable]
+    qualities = [value for value in qualities if value is not None]
+    avg_quality = sum(qualities) / len(qualities) if qualities else 0.0
+    best_quality = max(qualities) if qualities else 0.0
+    valid_window_count = sum(1 for row in usable if row.get("channel_validity_label") == "valid")
+
+    per_window: dict[int, list[float]] = {}
+    for row in usable:
+        quality = safe_float(row.get("quality_score"))
+        index_value = safe_float(row.get("window_index"))
+        if quality is None or index_value is None:
+            continue
+        per_window.setdefault(int(index_value), []).append(quality)
+    per_window_quality = {index: sum(values) / len(values) for index, values in per_window.items() if values}
+    best_window_index = max(per_window_quality, key=per_window_quality.get) if per_window_quality else None
+    best_rows = [row for row in usable if best_window_index is not None and int(safe_float(row.get("window_index")) or -1) == best_window_index]
+    best_start_values = [safe_float(row.get("start_offset_seconds")) for row in best_rows]
+    best_end_values = [safe_float(row.get("end_offset_seconds")) for row in best_rows]
+    best_start_values = [value for value in best_start_values if value is not None]
+    best_end_values = [value for value in best_end_values if value is not None]
+    best_start = min(best_start_values) if best_start_values else None
+    best_end = max(best_end_values) if best_end_values else None
+
+    channel_spreads = []
+    for index in per_window:
+        window_qualities = [
+            safe_float(row.get("quality_score"))
+            for row in usable
+            if int(safe_float(row.get("window_index")) or -1) == index
+        ]
+        window_qualities = [value for value in window_qualities if value is not None]
+        if len(window_qualities) >= 2:
+            channel_spreads.append(max(window_qualities) - min(window_qualities))
+    channel_drift = sum(channel_spreads) / len(channel_spreads) if channel_spreads else 0.0
+
+    ordered_window_quality = [per_window_quality[index] for index in sorted(per_window_quality)]
+    posture_shift = (
+        sum(abs(ordered_window_quality[index] - ordered_window_quality[index - 1]) for index in range(1, len(ordered_window_quality)))
+        / (len(ordered_window_quality) - 1)
+        if len(ordered_window_quality) >= 2
+        else 0.0
+    )
+    valid_fraction = valid_window_count / total_window_count if total_window_count else 0.0
+    stability = clamp(avg_quality * 0.55 + best_quality * 0.35 + valid_fraction * 10 - channel_drift * 0.4 - posture_shift * 0.4)
+    if total_window_count < 3:
+        label = "insufficient_windows"
+    elif stability >= 60 and best_quality >= 50 and valid_window_count >= 3:
+        label = "stable_valid"
+    elif best_quality >= 45 and valid_window_count >= 1:
+        label = "local_valid_segment"
+    else:
+        label = "unstable_or_noisy"
+    return {
+        "valid_window_count": valid_window_count,
+        "total_window_count": total_window_count,
+        "avg_window_quality_score": round(avg_quality, 3),
+        "pattern_stability_score": round(stability, 3),
+        "best_pattern_window_index": best_window_index,
+        "best_segment_start_time": round(best_start, 6) if best_start is not None else None,
+        "best_segment_end_time": round(best_end, 6) if best_end is not None else None,
+        "best_segment_duration": round(best_end - best_start, 6) if best_start is not None and best_end is not None else None,
+        "best_segment_quality_score": round(best_quality, 3),
+        "channel_specific_drift_score": round(clamp(channel_drift), 3),
+        "global_posture_shift_score": round(clamp(posture_shift), 3),
+        "pattern_validity_label": label,
+    }
+
+
 def summarize_measurement_quality(channel_rows: list[dict[str, Any]], duration_seconds: float | None = None) -> dict[str, Any]:
     core = [row for row in channel_rows if row.get("standard_channel_name") in CHANNEL_ORDER]
     usable = core or channel_rows
