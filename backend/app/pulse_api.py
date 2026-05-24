@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -15,12 +16,15 @@ from backend.app.database import SessionLocal, get_engine
 from backend.app.pulse_analysis_engine import (
     CHANNEL_ORDER,
     analyze_preview_signal,
+    analyze_raw_period_consistency,
     analyze_windowed_signal,
     classify_channel,
     standard_channel_name,
     summarize_measurement_quality,
     summarize_pattern_stability,
 )
+from backend.app.structured_parser import asset_path
+from backend.app.pulse_parser import source_review_status
 from backend.app.models import (
     Device,
     FeatureVariable,
@@ -107,6 +111,10 @@ def _load_phase1_analysis(dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> dict:
 
     quality = pd.read_csv(quality_path)
     reliability = pd.read_csv(reliability_path)
+    summary_path = analysis_dir / "summary.json"
+    analysis_summary = {}
+    if summary_path.exists():
+        analysis_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     duration_missing = int((quality.get("duration_available", pd.Series(dtype=bool)) == False).sum()) if "duration_available" in quality else 0
     validity_distribution = _count_rows(quality, "measurement_validity_label")
     source_quality = _group_quality(quality, "source_vendor")
@@ -161,11 +169,29 @@ def _load_phase1_analysis(dataset_dir: Path = PULSE_PHASE1_DATASET_DIR) -> dict:
         "slot_quality": slot_quality,
         "feature_risks": risk_rows,
         "quality_drift_scatter": scatter_rows,
+        "standard_feature_version": analysis_summary.get("standard_feature_version"),
+        "standard_feature_input_basis": analysis_summary.get("standard_feature_input_basis"),
+        "phase5_features": {
+            "record_feature_count": int(analysis_summary.get("record_feature_count") or 0),
+            "channel_feature_count": int(analysis_summary.get("channel_feature_count") or 0),
+            "beat_level_feature_count": int(analysis_summary.get("beat_level_feature_count") or 0),
+            "phase_variability_feature_count": int(analysis_summary.get("phase_variability_feature_count") or 0),
+            "residual_fluctuation_feature_count": int(analysis_summary.get("residual_fluctuation_feature_count") or 0),
+            "channel_structure_feature_count": int(analysis_summary.get("channel_structure_feature_count") or 0),
+            "pulse_rate_period_consistency_count": int(analysis_summary.get("pulse_rate_period_consistency_count") or 0),
+            "raw_period_template_count": int(analysis_summary.get("raw_period_template_count") or 0),
+            "double_period_dominant_channel_count": int(analysis_summary.get("double_period_dominant_channel_count") or 0),
+            "guan_double_period_dominant_count": int(analysis_summary.get("guan_double_period_dominant_count") or 0),
+            "promoted_period_selection_method": analysis_summary.get("promoted_period_selection_method"),
+            "promoted_period_selection_scope": analysis_summary.get("promoted_period_selection_scope"),
+        },
     }
 
 
 def measurement_payload(measurement: PulseMeasurement, visit: Visit, user: User, device: Device | None) -> dict:
     features = measurement.feature_json or {}
+    quality_flags = (visit.cheat_types or {}).get("flags") or []
+    review_status = source_review_status(visit.quality_status, quality_flags)
     return {
         "measurement_id": str(measurement.measurement_id),
         "visit_id": str(measurement.visit_id),
@@ -183,7 +209,11 @@ def measurement_payload(measurement: PulseMeasurement, visit: Visit, user: User,
         "pulse_position": measurement.pulse_position,
         "sampling_rate": as_json(measurement.sampling_rate),
         "quality_status": measurement.quality_status,
-        "quality_flags": (visit.cheat_types or {}).get("flags") or [],
+        "quality_flags": quality_flags,
+        "source_review_status": review_status,
+        "source_review_reasons": quality_flags,
+        "research_included": True,
+        "research_inclusion_status": "dedup_review_required" if review_status == "suspected_duplicate" else "eligible",
         "device_id": str(measurement.device_id) if measurement.device_id else None,
         "device_model": device.device_model if device else None,
         "source_device_id": device.source_device_id if device else None,
@@ -205,6 +235,242 @@ def phase1_analysis_summary():
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return jsonify(_load_phase1_analysis(path))
+
+
+def _feature_row_payload(row: pd.Series) -> dict:
+    result = {}
+    for key, value in row.items():
+        if pd.isna(value):
+            result[key] = None
+        elif isinstance(value, (datetime, date)):
+            result[key] = value.isoformat()
+        elif hasattr(value, "item"):
+            result[key] = value.item()
+        else:
+            result[key] = value
+    return result
+
+
+@pulse_api.route("/analysis/feature-summary", methods=["GET"])
+def pulse_feature_summary():
+    measurement_id = request.args.get("measurement_id") or request.args.get("record_id")
+    if not measurement_id:
+        return jsonify({"available": False, "message": "measurement_id is required"}), 400
+    dataset_dir = request.args.get("dataset_dir")
+    path = Path(dataset_dir) if dataset_dir else PULSE_PHASE1_DATASET_DIR
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    analysis_dir = path / "analysis" / "phase1"
+    tables = {
+        "record_feature": False,
+        "channel_feature": True,
+        "phase_variability_feature": True,
+        "residual_fluctuation_feature": True,
+        "channel_structure_feature": False,
+    }
+    result: dict[str, object] = {
+        "available": True,
+        "measurement_id": measurement_id,
+        "analysis_dir": str(analysis_dir),
+    }
+    for table_name, multiple in tables.items():
+        table_path = analysis_dir / f"{table_name}.csv"
+        if not table_path.exists():
+            return jsonify({"available": False, "measurement_id": measurement_id, "message": "pulse phase5 feature output not found"})
+        frame = pd.read_csv(table_path)
+        matches = frame[frame["measurement_id"].astype(str) == measurement_id] if "measurement_id" in frame else pd.DataFrame()
+        payload = [_feature_row_payload(row) for _, row in matches.iterrows()]
+        result[table_name] = payload if multiple else (payload[0] if payload else None)
+    if not result["record_feature"]:
+        return jsonify({"available": False, "measurement_id": measurement_id, "message": "pulse measurement feature summary not found"}), 404
+    record_feature = result["record_feature"]
+    result["feature_version"] = record_feature.get("feature_version") if isinstance(record_feature, dict) else None
+    result["input_basis"] = "waveform_preview"
+    return jsonify(result)
+
+
+@pulse_api.route("/analysis/device-fit-overview", methods=["GET"])
+def pulse_device_fit_overview():
+    dataset_dir = request.args.get("dataset_dir")
+    user_id = request.args.get("user_id")
+    path = Path(dataset_dir) if dataset_dir else PULSE_PHASE1_DATASET_DIR
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    analysis_dir = path / "analysis" / "phase1"
+    quality_path = analysis_dir / "patient_quality_summary.csv"
+    fit_path = analysis_dir / "patient_device_fit_summary.csv"
+    if not quality_path.exists() or not fit_path.exists():
+        return jsonify({"available": False, "message": "pulse phase6 patient device-fit output not found"})
+
+    quality = pd.read_csv(quality_path)
+    device_fit = pd.read_csv(fit_path)
+    if user_id:
+        quality = quality[quality["user_id"].astype(str) == user_id]
+        device_fit = device_fit[device_fit["user_id"].astype(str) == user_id]
+    quality_columns = [
+        "user_id",
+        "measurement_count",
+        "valid_measurement_count",
+        "partial_valid_measurement_count",
+        "invalid_measurement_count",
+        "valid_measurement_rate",
+        "usable_measurement_rate",
+        "avg_signal_quality_score",
+        "avg_overall_periodic_snr",
+        "avg_stable_segment_ratio",
+    ]
+    patient_quality = quality[[column for column in quality_columns if column in quality]].rename(
+        columns={"measurement_count": "quality_measurement_count"}
+    )
+    merged = device_fit.merge(
+        patient_quality,
+        on="user_id",
+        how="left",
+    )
+    summary_path = analysis_dir / "summary.json"
+    analysis_summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    patients = [_feature_row_payload(row) for _, row in merged.iterrows()]
+    persistent_flags = device_fit["persistent_alignment_flag"].astype(str).str.lower().isin({"true", "1", "yes"})
+    return jsonify(
+        {
+            "available": True,
+            "analysis_dir": str(analysis_dir),
+            "feature_version": analysis_summary.get("patient_device_fit_version", "pulse_patient_device_fit_v1"),
+            "input_basis": analysis_summary.get("patient_device_fit_input_basis"),
+            "patient_count": int(len(patients)),
+            "high_risk_patient_count": int((device_fit["device_fit_risk_label"] == "high").sum()),
+            "medium_risk_patient_count": int((device_fit["device_fit_risk_label"] == "medium").sum()),
+            "persistent_alignment_patient_count": int(persistent_flags.sum()),
+            "wrist_circumference_available": bool(analysis_summary.get("wrist_circumference_available", False)),
+            "limitation_message": "当前缺少腕围数据，设备适配风险基于长期通道未对齐与通道质量模式推断，不能直接确认为设备尺寸不匹配。",
+            "patients": patients,
+        }
+    )
+
+
+@pulse_api.route("/analysis/personal-baseline", methods=["GET"])
+def pulse_personal_baseline():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"available": False, "message": "user_id is required"}), 400
+    dataset_dir = request.args.get("dataset_dir")
+    path = Path(dataset_dir) if dataset_dir else PULSE_PHASE1_DATASET_DIR
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    analysis_dir = path / "analysis" / "phase1"
+    baseline_path = analysis_dir / "personal_baseline_feature.csv"
+    range_path = analysis_dir / "personal_normal_range.csv"
+    deviation_path = analysis_dir / "baseline_deviation_score.csv"
+    if not baseline_path.exists() or not range_path.exists() or not deviation_path.exists():
+        return jsonify({"available": False, "message": "pulse phase7 personal baseline output not found"})
+    baseline = pd.read_csv(baseline_path)
+    normal_range = pd.read_csv(range_path)
+    deviations = pd.read_csv(deviation_path)
+    baseline = baseline[baseline["user_id"].astype(str) == user_id]
+    normal_range = normal_range[normal_range["user_id"].astype(str) == user_id]
+    deviations = deviations[deviations["user_id"].astype(str) == user_id]
+    if baseline.empty:
+        return jsonify({"available": False, "user_id": user_id, "message": "patient personal baseline not found"}), 404
+    channels = []
+    for _, row in baseline.iterrows():
+        payload = _feature_row_payload(row)
+        vector = payload.pop("personal_baseline_template_json", None)
+        payload["personal_baseline_template"] = json.loads(vector) if vector else []
+        channel = str(row["standard_channel_name"])
+        ranges = normal_range[normal_range["standard_channel_name"] == channel]
+        payload["normal_ranges"] = [_feature_row_payload(item) for _, item in ranges.iterrows()]
+        channel_deviations = deviations[deviations["standard_channel_name"] == channel]
+        payload["deviation_rows"] = [_feature_row_payload(item) for _, item in channel_deviations.iterrows()]
+        channels.append(payload)
+    summary_path = analysis_dir / "summary.json"
+    analysis_summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    return jsonify(
+        {
+            "available": True,
+            "user_id": user_id,
+            "feature_version": analysis_summary.get("personal_baseline_version", "pulse_personal_baseline_v1"),
+            "input_basis": analysis_summary.get("personal_baseline_input_basis"),
+            "baseline_available_count": int((baseline["baseline_status"] == "available").sum()),
+            "excluded_persistent_alignment_count": int((baseline["baseline_status"] == "excluded_persistent_alignment").sum()),
+            "insufficient_eligible_count": int((baseline["baseline_status"] == "insufficient_eligible_records").sum()),
+            "channels": channels,
+            "interpretation_note": "个人基线仅由满足质量门槛且未被长期未对准规则排除的通道记录建立；未建立基线的通道不参与个体状态偏离解释。",
+        }
+    )
+
+
+def _resolve_period_measurement(session, measurement_id: str | None, record_id: str | None, user_id: str | None):
+    stmt = select(PulseMeasurement)
+    if measurement_id:
+        try:
+            stmt = stmt.where(PulseMeasurement.measurement_id == UUID(measurement_id))
+        except ValueError:
+            return None
+    elif record_id:
+        stmt = stmt.where(PulseMeasurement.source_measurement_id == record_id)
+        if user_id:
+            stmt = stmt.where(PulseMeasurement.user_id == UUID(user_id))
+    else:
+        return None
+    return session.execute(stmt.order_by(PulseMeasurement.start_time.desc())).scalars().first()
+
+
+def _measurement_raw_payload(session, measurement: PulseMeasurement) -> tuple[dict | None, FileAsset | None]:
+    asset = session.execute(
+        select(FileAsset)
+        .where(
+            FileAsset.modality_record_id == measurement.modality_record_id,
+            FileAsset.asset_type == "pulse_json",
+        )
+        .order_by(FileAsset.created_at.desc())
+    ).scalars().first()
+    if not asset:
+        return None, None
+    path = asset_path(asset)
+    if not path or not path.exists():
+        return None, asset
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, asset
+    return payload if isinstance(payload, dict) else None, asset
+
+
+@pulse_api.route("/analysis/period-consistency", methods=["GET"])
+def pulse_period_consistency():
+    measurement_id = request.args.get("measurement_id")
+    record_id = request.args.get("record_id") or request.args.get("source_measurement_id")
+    user_id = request.args.get("user_id")
+    if not measurement_id and not record_id:
+        return jsonify({"available": False, "message": "measurement_id or record_id is required"}), 400
+    get_engine()
+    with SessionLocal() as session:
+        measurement = _resolve_period_measurement(session, measurement_id, record_id, user_id)
+        if measurement is None:
+            return jsonify({"available": False, "message": "pulse measurement not found"}), 404
+        raw_payload, asset = _measurement_raw_payload(session, measurement)
+    if raw_payload is None:
+        return jsonify(
+            {
+                "available": False,
+                "measurement_id": str(measurement.measurement_id),
+                "source_measurement_id": measurement.source_measurement_id,
+                "message": "original pulse waveform asset not found",
+            }
+        ), 404
+    analysis = analyze_raw_period_consistency(
+        raw_payload,
+        (measurement.feature_json or {}).get("pulse_rate"),
+        float(measurement.sampling_rate) if measurement.sampling_rate else None,
+    )
+    return jsonify(
+        {
+            **analysis,
+            "measurement_id": str(measurement.measurement_id),
+            "source_measurement_id": measurement.source_measurement_id,
+            "asset_id": str(asset.asset_id) if asset else None,
+        }
+    )
 
 
 def _round_vector(values: list[float], digits: int = 6) -> list[float]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from collections import Counter
 from typing import Any
@@ -13,13 +14,14 @@ from backend.app.feature_wide import rebuild_visit_feature_wide
 from backend.app.models import AnalysisRun, Device, FeatureVariable, FileAsset, ModalityRecord, PulseMeasurement, PulseMeasurementQuality, PulsePositionFeature, PulseWaveformAsset, Visit
 from backend.app.pulse_analysis_engine import (
     analyze_preview_signal,
+    analyze_raw_period_consistency,
     analyze_windowed_signal,
     classify_channel,
     standard_channel_name,
     summarize_measurement_quality,
     summarize_pattern_stability,
 )
-from backend.app.structured_parser import build_structured_modalities
+from backend.app.structured_parser import asset_path, build_structured_modalities
 
 MODALITIES = ["ask", "pulse", "tongue", "face", "voice", "report"]
 PULSE_QUALITY_FEATURES = {"stability_score", "valid_segment_count", "segment_count"}
@@ -278,6 +280,14 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
         measurement.measurement_id: measurement
         for measurement in _scalars(session, select(PulseMeasurement).where(PulseMeasurement.measurement_id.in_(measurement_ids)))
     }
+    raw_assets = _scalars(
+        session,
+        select(FileAsset).where(
+            FileAsset.modality_record_id.in_([measurement.modality_record_id for measurement in measurements.values()]),
+            FileAsset.asset_type == "pulse_json",
+        ),
+    )
+    raw_asset_by_modality = {asset.modality_record_id: asset for asset in raw_assets}
     waveforms = _scalars(
         session,
         select(PulseWaveformAsset)
@@ -315,8 +325,13 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
 
     analysis_run = AnalysisRun(
         analysis_type="pulse_online_ingest_analysis",
-        code_version="pulse_analysis_engine_v2",
-        parameter_json={"trigger": "parse_structured_data"},
+        code_version="pulse_analysis_engine_v3",
+        parameter_json={
+            "trigger": "parse_structured_data",
+            "period_consistency_version": "pulse_rate_period_consistency_v1",
+            "period_selection_method": "rate_guided_band_0.05",
+            "period_selection_scope": "period_alignment_only",
+        },
         status="completed",
         result_summary_json={"measurement_count": len(grouped)},
     )
@@ -325,6 +340,21 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
 
     inserted = 0
     for measurement_id, rows in grouped.items():
+        measurement = measurements[measurement_id]
+        raw_period_consistency = None
+        raw_asset = raw_asset_by_modality.get(measurement.modality_record_id)
+        raw_path = asset_path(raw_asset) if raw_asset else None
+        if raw_path and raw_path.exists():
+            try:
+                raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
+                if isinstance(raw_payload, dict):
+                    raw_period_consistency = analyze_raw_period_consistency(
+                        raw_payload,
+                        (measurement.feature_json or {}).get("pulse_rate"),
+                        float(measurement.sampling_rate) if measurement.sampling_rate else None,
+                    )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                raw_period_consistency = None
         energies = [float(row["pulse_energy"]) for row in rows if row.get("pulse_energy")]
         median_energy = sorted(energies)[len(energies) // 2] if energies else None
         labelled_rows = []
@@ -355,6 +385,7 @@ def _sync_pulse_online_analysis(session: Session, measurement_ids: list[uuid.UUI
                     "pattern_summary": pattern_summary,
                     "channel_rows": labelled_rows,
                     "window_rows": window_grouped.get(measurement_id, []),
+                    "pulse_rate_period_consistency": raw_period_consistency,
                 },
             )
         )

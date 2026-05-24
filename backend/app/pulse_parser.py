@@ -131,6 +131,36 @@ def normalize_included(status: str | None, stability_score: float | int | None) 
     return float(stability_score) >= 50
 
 
+def source_review_status(status: str | None, flags: list[str] | None = None) -> str:
+    reasons = flags or []
+    if status == "suspicious" or any("重复病例目录" in reason for reason in reasons):
+        return "suspected_duplicate"
+    if status == "incomplete":
+        return "incomplete_source"
+    return "normal"
+
+
+def research_inclusion_policy(record: dict[str, Any], visit: Visit) -> dict[str, Any]:
+    flags = (visit.cheat_types or {}).get("flags") or []
+    platform_included = normalize_included(visit.quality_status, record.get("stability_score"))
+    review_status = source_review_status(visit.quality_status, flags)
+    has_pulse_data = bool(record.get("waveform_preview") or record.get("measurements"))
+    if not has_pulse_data:
+        research_status = "insufficient_pulse_data"
+    elif review_status == "suspected_duplicate":
+        research_status = "dedup_review_required"
+    else:
+        research_status = "eligible"
+    return {
+        "included": platform_included,
+        "platform_included": platform_included,
+        "source_review_status": review_status,
+        "source_review_reasons": flags,
+        "research_included": has_pulse_data,
+        "research_inclusion_status": research_status,
+    }
+
+
 def yushengtang_record(asset: dict[str, Any], fields: dict[str, Any], visit: Visit) -> dict[str, Any]:
     parsed_fields = parse_fields(fields)
     waveform_summary = OrderedDict()
@@ -199,7 +229,7 @@ def yushengtang_record(asset: dict[str, Any], fields: dict[str, Any], visit: Vis
             "PeakAngle": parsed_fields.get("PeakAngle"),
         },
     }
-    record["included"] = normalize_included(visit.quality_status, record["stability_score"])
+    record.update(research_inclusion_policy(record, visit))
     return record
 
 
@@ -338,7 +368,7 @@ def parse_zhongke_pulse_excel(path: Path, visit: Visit) -> dict[str, Any] | None
             "doctor": first[9] if len(first) > 9 else None,
         },
     }
-    pulse_record["included"] = normalize_included(visit.quality_status, pulse_record["stability_score"])
+    pulse_record.update(research_inclusion_policy(pulse_record, visit))
     return pulse_record
 
 

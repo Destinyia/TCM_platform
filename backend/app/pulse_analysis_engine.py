@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
+import numpy as np
+
 
 CHANNEL_ORDER = ["cun", "guan", "chi"]
+RAW_CHANNEL_FIELDS = {"cun": "Cun", "guan": "GuanMai", "chi": "Chi"}
+PERIOD_CONSISTENCY_VERSION = "pulse_rate_period_consistency_v1"
+PERIOD_SEARCH_BAND = 0.05
 
 
 def safe_float(value: Any) -> float | None:
@@ -47,6 +53,19 @@ def extract_preview_values(preview: Any) -> list[float]:
         if value is not None:
             values.append(value)
     return values
+
+
+def extract_raw_values(raw_payload: dict[str, Any], source_field: str) -> list[float]:
+    raw_values = raw_payload.get(source_field)
+    if isinstance(raw_values, str):
+        try:
+            raw_values = json.loads(raw_values)
+        except json.JSONDecodeError:
+            raw_values = []
+    if not isinstance(raw_values, list):
+        return []
+    values = [safe_float(value) for value in raw_values]
+    return [value for value in values if value is not None]
 
 
 def mean_std(values: list[float]) -> tuple[float | None, float | None]:
@@ -167,6 +186,128 @@ def build_periodic_template(values: list[float], lag: int | None) -> tuple[list[
     repeated = [template[index % lag] for index in range(len(values))]
     residual = [value - predicted for value, predicted in zip(values, repeated)]
     return template, repeated, residual
+
+
+def _raw_autocorrelation(values: list[float]) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    if len(values) < 32:
+        return None, None
+    signal = np.asarray(values, dtype=float)
+    positions = np.arange(signal.size, dtype=float)
+    slope, intercept = np.polyfit(positions, signal, 1)
+    centered = signal - (slope * positions + intercept)
+    centered = centered - float(centered.mean())
+    energy = float(np.dot(centered, centered))
+    if energy <= 1e-12:
+        return None, None
+    fft_size = 1 << (2 * signal.size - 1).bit_length()
+    spectrum = np.fft.rfft(centered, fft_size)
+    acf = np.fft.irfft(spectrum * np.conjugate(spectrum), fft_size)[: signal.size] / energy
+    return centered, acf
+
+
+def _raw_template_candidate(signal: np.ndarray, acf: np.ndarray, sampling_rate: float, center_lag: float, search_band: float) -> dict[str, Any] | None:
+    low = max(2, int(round(center_lag * (1.0 - search_band))))
+    high = min(signal.size - 1, int(round(center_lag * (1.0 + search_band))))
+    if high < low:
+        return None
+    lag = low + int(np.argmax(acf[low : high + 1]))
+    phase = np.arange(signal.size) % lag
+    counts = np.bincount(phase, minlength=lag)
+    sums = np.bincount(phase, weights=signal, minlength=lag)
+    template = sums / np.maximum(counts, 1)
+    reconstruction = template[phase]
+    residual = signal - reconstruction
+    signal_variance = float(np.var(signal))
+    residual_variance = float(np.var(residual))
+    template_variance = float(np.var(reconstruction))
+    return {
+        "lag_samples": int(lag),
+        "period_seconds": round(float(lag / sampling_rate), 6),
+        "pulse_rate_bpm": round(float(sampling_rate * 60.0 / lag), 6),
+        "coherence": round(float(acf[lag]), 6),
+        "periodic_snr": round(float(template_variance / max(residual_variance, 1e-12)), 6),
+        "template_explained_variance_ratio": round(float(1.0 - residual_variance / max(signal_variance, 1e-12)), 6),
+        "template_vector": [round(float(value), 6) for value in template],
+    }
+
+
+def analyze_raw_period_consistency(
+    raw_payload: dict[str, Any],
+    pulse_rate_bpm: float | None,
+    sampling_rate: float | None = None,
+    search_band: float = PERIOD_SEARCH_BAND,
+) -> dict[str, Any]:
+    pulse_rate = safe_float(pulse_rate_bpm)
+    rate = safe_float(sampling_rate) or 500.0
+    if pulse_rate is None or pulse_rate <= 0:
+        return {"available": False, "message": "PulseNumbers is unavailable"}
+    expected_period_seconds = 60.0 / pulse_rate
+    expected_lag_samples = expected_period_seconds * rate
+    channels = []
+    for channel, source_field in RAW_CHANNEL_FIELDS.items():
+        signal, acf = _raw_autocorrelation(extract_raw_values(raw_payload, source_field))
+        if signal is None or acf is None:
+            continue
+        half = _raw_template_candidate(signal, acf, rate, expected_lag_samples * 0.5, search_band)
+        nominal = _raw_template_candidate(signal, acf, rate, expected_lag_samples, search_band)
+        double = _raw_template_candidate(signal, acf, rate, expected_lag_samples * 2.0, search_band)
+        if nominal is None:
+            continue
+        candidates = {
+            "half_period_candidate": half,
+            "nominal_period_candidate": nominal,
+            "double_period_candidate": double,
+        }
+        candidates = {key: value for key, value in candidates.items() if value is not None}
+        morphology_type, morphology = max(candidates.items(), key=lambda item: item[1]["coherence"])
+        ratio = nominal["period_seconds"] / expected_period_seconds
+        error = abs(ratio - 1.0)
+        half_margin = round(half["coherence"] - nominal["coherence"], 6) if half else None
+        double_margin = round(double["coherence"] - nominal["coherence"], 6) if double else None
+        half_dominant = bool(half and half["coherence"] >= 0.20 and (half_margin or 0.0) >= 0.10)
+        double_dominant = bool(double and double["coherence"] >= 0.20 and (double_margin or 0.0) >= 0.10)
+        if double_dominant:
+            label = "double_period_dominant"
+        elif half_dominant:
+            label = "half_period_dominant"
+        elif nominal["coherence"] >= 0.10 and error <= 0.20:
+            label = "pulse_rate_consistent"
+        else:
+            label = "pulse_rate_locked_low_coherence"
+        channels.append(
+            {
+                "standard_channel_name": channel,
+                "pulse_rate_period_consistency": round(max(0.0, 1.0 - error), 6),
+                "pulse_rate_period_consistency_label": label,
+                "selected_period_seconds": nominal["period_seconds"],
+                "selected_period_bpm": nominal["pulse_rate_bpm"],
+                "selected_period_error_ratio": round(error, 6),
+                "selected_template_coherence": nominal["coherence"],
+                "half_period_dominance_margin": half_margin,
+                "double_period_dominance_margin": double_margin,
+                "half_period_dominant_flag": half_dominant,
+                "double_period_dominant_flag": double_dominant,
+                "morphology_dominant_candidate_type": morphology_type,
+                "pulse_rate_guided_template": nominal,
+                "morphology_dominant_template": morphology,
+                "half_period_candidate": half,
+                "nominal_period_candidate": nominal,
+                "double_period_candidate": double,
+            }
+        )
+    return {
+        "available": bool(channels),
+        "input_basis": "raw_waveform",
+        "feature_version": PERIOD_CONSISTENCY_VERSION,
+        "period_selection_method": f"rate_guided_band_{search_band:.2f}",
+        "period_selection_scope": "period_alignment_only",
+        "pulse_rate_bpm": round(pulse_rate, 6),
+        "expected_period_seconds": round(expected_period_seconds, 6),
+        "expected_lag_samples": round(expected_lag_samples, 6),
+        "double_period_dominant_count": sum(1 for row in channels if row["double_period_dominant_flag"]),
+        "half_period_dominant_count": sum(1 for row in channels if row["half_period_dominant_flag"]),
+        "channels": channels,
+    }
 
 
 def normalize_vector(values: list[float]) -> list[float]:

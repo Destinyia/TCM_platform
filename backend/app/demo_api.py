@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.app.config import STORAGE_ROOT, STORAGE_URI_PREFIX
 from backend.app.database import SessionLocal, get_engine
 from backend.app.models import DatasetVersion, FileAsset, ModalityRecord, QualityEvent, User, UserDayPanel, Visit, VisitFeatureWide
+from backend.app.pulse_parser import research_inclusion_policy
 
 demo_api = Blueprint("demo_api", __name__)
 
@@ -128,9 +129,11 @@ def flatten_pulse_records(session) -> list[dict]:
     for modality, visit, user in rows:
         payload = modality.parsed_structured_data_json or {}
         for record in payload.get("records") or []:
+            policy = research_inclusion_policy(record, visit)
             records.append(
                 {
                     **record,
+                    **policy,
                     "visit_id": str(visit.visit_id),
                     "modality_record_id": str(modality.modality_record_id),
                     "user_id": str(user.user_id),
@@ -140,6 +143,7 @@ def flatten_pulse_records(session) -> list[dict]:
                     "visit_time": visit.visit_time.strftime("%H:%M") if visit.visit_time else None,
                     "slot": visit.visit_slot,
                     "quality_status": visit.quality_status,
+                    "quality_flags": quality_flags(visit),
                 }
             )
     return records

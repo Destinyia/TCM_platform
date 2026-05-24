@@ -37,7 +37,15 @@ export const api = {
   pulseCrossUser: () => fetchJson('/api/demo/pulse/cross-user'),
   pulseFeatureDrift: (params) => fetchJson('/api/demo/pulse/feature-drift', params),
   pulsePhase1Summary: () => fetchJson('/api/pulse/analysis/phase1-summary'),
-  pulseUserSummary: (params) => fetchJson('/api/pulse/analysis/user-summary', params)
+  pulseUserSummary: (params) => fetchJson('/api/pulse/analysis/user-summary', params),
+  getPulseUsers: (params) => fetchJson('/api/demo/users', params),
+  getPulseUserSummary: (userId) => fetchJson('/api/pulse/analysis/user-summary', { user_id: userId }),
+  getPulseUserRecords: (userId, filters = {}) => fetchJson('/api/demo/pulse/records', { user_id: userId, include_suspicious: true, ...filters }),
+  getPulseRecordDetail: (userId, recordId) => fetchJson('/api/demo/pulse/records', { user_id: userId, include_suspicious: true, record_id: recordId }),
+  getPulseFeatureSummary: (measurementId) => fetchJson('/api/pulse/analysis/feature-summary', { measurement_id: measurementId }),
+  getPulsePeriodConsistency: (userId, recordId) => fetchJson('/api/pulse/analysis/period-consistency', { user_id: userId, record_id: recordId }),
+  getPulseDeviceFitOverview: (params) => fetchJson('/api/pulse/analysis/device-fit-overview', params),
+  getPulsePersonalBaseline: (userId) => fetchJson('/api/pulse/analysis/personal-baseline', { user_id: userId })
 }
 
 export function apiUrl(path) {

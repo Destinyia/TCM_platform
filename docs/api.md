@@ -1,6 +1,6 @@
 # 多模态数据平台 API 与路由索引
 
-更新时间：2026-05-20
+更新时间：2026-05-23
 
 ## 1. 基础信息
 
@@ -24,7 +24,7 @@
 | `/patients` | `Patients.vue` | `GET /api/demo/users` |
 | `/patients/:id` | `PatientDetail.vue` | `GET /api/demo/users/{user_id}/timeline`、`GET /api/demo/pulse/user-trend` |
 | `/examinations` | `Examinations.vue` | `GET /api/demo/visits` |
-| `/pulse-analysis` | `PulseAnalysis.vue` | `GET /api/demo/pulse/*` |
+| `/pulse-analysis` | `PulseAnalysis.vue` | `GET /api/demo/pulse/*`、`GET /api/pulse/analysis/user-summary`、`GET /api/pulse/analysis/period-consistency` |
 | `/import` | `Import.vue` | 说明页/后续导入入口 |
 | `/export` | `Export.vue` | `GET /api/demo/dataset-versions` |
 
@@ -223,9 +223,21 @@ Query：
 | 参数 | 说明 |
 | --- | --- |
 | `user_id` | 可选，按用户过滤 |
-| `include_suspicious` | 可选，是否纳入疑似异常 |
+| `include_suspicious` | 兼容参数；`true` 时返回需来源复核的记录，由调用方根据研究策略处理 |
 
-返回字段来自脉诊 `parsed_structured_data_json.records[]`，并补充 `visit_id`、`modality_record_id`、`user_id`、`user_name`、`source_vendor`、`visit_date`、`visit_time`、`slot`、`quality_status`。
+返回字段来自脉诊 `parsed_structured_data_json.records[]`，并补充 `visit_id`、`modality_record_id`、`user_id`、`user_name`、`source_vendor`、`visit_date`、`visit_time`、`slot`、`quality_status`、`quality_flags`。
+
+脉诊专项分析不得把历史字段 `included` 直接解释为信号质量。接口返回以下分离字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `platform_included` / `included` | 历史平台纳入规则结果，仅用于兼容旧展示与旧筛选 |
+| `source_review_status` | 来源复核状态：`normal`、`suspected_duplicate`、`incomplete_source` |
+| `source_review_reasons` | 来源侧复核原因，例如重复病例目录、模态缺失 |
+| `research_included` | 是否具备脉诊专项分析的数据载荷，不受疑似重复来源直接否决 |
+| `research_inclusion_status` | 研究处理策略：`eligible`、`dedup_review_required`、`insufficient_pulse_data` |
+
+当前规则中，`suspected_duplicate` 记录保留在脉诊分析视图中并标注需去重复核；其波形质量由脉诊质量算法独立计算。
 
 ### 4.2 `GET /api/demo/pulse/user-trend`
 
@@ -283,6 +295,11 @@ storage/datasets/DS-PULSE-PHASE1/v2026.05.phase1.001/analysis/phase1/
 | `slot_quality` | 按时段统计的有效性、平均质量分、平均漂移 |
 | `feature_risks` | 特征可靠性风险排序，来自 `feature_reliability.csv` |
 | `quality_drift_scatter` | 质量分与漂移指数散点采样 |
+| `phase5_features.pulse_rate_period_consistency_count` | 原始波形周期一致性通道数量 |
+| `phase5_features.raw_period_template_count` | 原始波形双角色模板数量 |
+| `phase5_features.double_period_dominant_channel_count` | 倍周期主导通道数量 |
+| `phase5_features.guan_double_period_dominant_count` | 关脉倍周期主导通道数量 |
+| `phase5_features.promoted_period_selection_method` | 当前推广的 PulseNumbers 周期搜索参数 |
 
 ### 5.2 `GET /api/pulse/analysis/user-summary`
 
@@ -307,7 +324,89 @@ Query：
 | `waveforms` | 示例 measurement 的三通道预览波形 |
 | `templates` | 示例 measurement 的三通道归一化模板 |
 
-### 5.3 `GET /api/pulse/measurements`
+### 5.3 `GET /api/pulse/analysis/period-consistency`
+
+用途：在患者详情选择单条记录后，从其原始脉诊 JSON 资产实时计算 `pulse_rate_period_consistency_v1`。该接口用于展示 PulseNumbers 对齐周期、半周期/倍周期形态候选和双角色模板，不将周期对齐直接解释为高质量。
+
+Query：
+
+| 参数 | 说明 |
+| --- | --- |
+| `measurement_id` | 可选，标准 measurement ID；与 `record_id` 至少提供一个 |
+| `record_id` | 可选，来源记录 ID，例如玉生堂原始资产 ID |
+| `user_id` | 通过 `record_id` 查询时可提供，用于限定患者 |
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `feature_version` | 当前为 `pulse_rate_period_consistency_v1` |
+| `input_basis` | `raw_waveform` |
+| `period_selection_method` | 当前为 `rate_guided_band_0.05` |
+| `period_selection_scope` | `period_alignment_only`，明确不替代质量判定 |
+| `pulse_rate_bpm` / `expected_period_seconds` | PulseNumbers 和其对应周期 |
+| `channels[]` | 寸、关、尺逐通道周期分析 |
+| `channels[].pulse_rate_period_consistency` | 对齐模板周期与 PulseNumbers 的一致性 |
+| `channels[].half_period_candidate` / `double_period_candidate` | 半周期/倍周期候选模板及其相关性 |
+| `channels[].pulse_rate_guided_template` | 周期对齐模板 |
+| `channels[].morphology_dominant_template` | 形态证据最强模板 |
+| `channels[].double_period_dominant_flag` | 是否存在倍周期形态主导证据 |
+
+入库同步说明：结构化解析写入新脉诊记录后，`backend/app/structured_ingest.py` 通过相同后端引擎计算结果，并将其写入 `fact_pulse_measurement_quality.result_json.pulse_rate_period_consistency`。已有数据无需重入库即可通过本接口即时计算。
+
+### 5.4 `GET /api/pulse/analysis/device-fit-overview`
+
+用途：读取阶段六离线生成的患者质量与设备适配风险产物，供数据概览页展示患者风险排名和寸、关、尺长期疑似未对准比例。
+
+Query：
+
+| 参数 | 说明 |
+| --- | --- |
+| `user_id` | 可选，限制为单个患者 |
+| `dataset_dir` | 可选，指定包含 `analysis/phase1` 产物的数据集目录 |
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `feature_version` | 当前为 `pulse_patient_device_fit_v1` |
+| `input_basis` | 当前为 `waveform_preview_longitudinal_channel_quality` |
+| `patients[]` | 患者级质量与设备适配风险行 |
+| `patients[].patient_device_fit_risk_score` | 按通道疑似未对准、低 SNR、低能量和持续不平衡计算的风险评分 |
+| `patients[].persistent_channel_failure_pattern` | 长期主要通道质量不足组合 |
+| `patients[].cun_alignment_suspicion_rate` / `guan_alignment_suspicion_rate` / `chi_alignment_suspicion_rate` | 三通道疑似未对准比例 |
+| `wrist_circumference_available` / `limitation_message` | 腕围等体征数据是否可用于设备尺寸解释及限制说明 |
+
+口径说明：`patient_quality_summary.csv` 汇总全部 measurement 的质量结果；`patient_device_fit_summary.csv` 仅基于具有三通道波形预览、可计算通道质量的记录。当前数据无腕围字段，因此风险结果只能作为长期固定通道未对准和设备适配复核线索。
+
+### 5.5 `GET /api/pulse/analysis/personal-baseline`
+
+用途：读取阶段七个人基线产物，为患者 summary 页展示个人三通道基线模板、正常波动范围及基线建立状态。
+
+Query：
+
+| 参数 | 说明 |
+| --- | --- |
+| `user_id` | 必填，患者 ID |
+| `dataset_dir` | 可选，指定包含 `analysis/phase1` 产物的数据集目录 |
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `feature_version` | 当前为 `pulse_personal_baseline_v1` |
+| `input_basis` | 当前为 `waveform_preview_normalized_template` |
+| `baseline_available_count` | 该患者可使用的个人基线通道数量 |
+| `excluded_persistent_alignment_count` | 因长期疑似未对准而排除的通道数量 |
+| `insufficient_eligible_count` | 因合格样本不足而未建立基线的通道数量 |
+| `channels[].baseline_status` | `available`、`excluded_persistent_alignment` 或 `insufficient_eligible_records` |
+| `channels[].personal_baseline_template` | 可用通道的 64 点归一化个人模板 |
+| `channels[].normal_ranges` | 该通道特征中位数、MAD 和正常范围 |
+| `channels[].deviation_rows` | 该通道各记录相对个人基线的偏离评分与主要偏离来源 |
+
+筛选口径：仅将通道有效、记录质量可用、模板质量分数 `>= 45`、压力伪影评分 `<= 0.4` 且未被阶段六识别为长期疑似未对准的通道记录纳入基线；每个患者-通道至少需要 `3` 条入选记录。
+
+### 5.6 `GET /api/pulse/measurements`
 
 用途：查询脉诊 measurement 样本主表。
 
@@ -337,23 +436,23 @@ Query：
 | `quality_status` / `quality_flags` | 质量状态 |
 | `feature_json` | measurement 级特征摘要 |
 
-### 5.4 `GET /api/pulse/measurements/{measurement_id}`
+### 5.7 `GET /api/pulse/measurements/{measurement_id}`
 
 用途：查询单次脉诊 measurement 详情。
 
-### 5.5 `GET /api/pulse/measurements/{measurement_id}/waveforms`
+### 5.8 `GET /api/pulse/measurements/{measurement_id}/waveforms`
 
 用途：查询单次测量的波形资产索引和预览点。
 
 返回字段来自 `fact_pulse_waveform_asset`，包括 `channel_name`、`sample_count`、`sampling_rate`、`storage_uri`、`data_format`、`preview_json`、`summary_json`。
 
-### 5.6 `GET /api/pulse/measurements/{measurement_id}/position-features`
+### 5.9 `GET /api/pulse/measurements/{measurement_id}/position-features`
 
 用途：查询单次测量的部位级特征明细。
 
 返回字段来自 `fact_pulse_position_feature`，包括 `hand_side`、`pulse_position`、`feature_name`、`feature_value`、`source_field`、`parser_version`、`quality_weight`。
 
-### 5.7 `GET /api/pulse/features`
+### 5.10 `GET /api/pulse/features`
 
 用途：查询 measurement 级扁平特征行。
 
@@ -363,7 +462,7 @@ Query：
 | --- | --- |
 | `feature_name` | 可选，按变量名过滤 |
 
-### 5.8 `GET /api/pulse/feature-variables`
+### 5.11 `GET /api/pulse/feature-variables`
 
 用途：查询脉诊变量字典。
 
